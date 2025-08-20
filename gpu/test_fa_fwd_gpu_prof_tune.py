@@ -159,7 +159,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         if fp8_v:
             p = p.to(tl.float8e5)
         else:
-            p = p.to(tl.float16)
+            # p = p.to(tl.float16)
+            p = p.to(v.dtype) # 需修改成 v.dtype 支持 bf16
         acc = tl.dot(p, v, acc)
         # update m_i and l_i
         m_i = m_ij
@@ -168,35 +169,57 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     return acc, l_i, m_i
 
 
-def get_autotune_config():
-    return [
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_stages=1, num_warps=1),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_stages=1, num_warps=1),
+# def get_autotune_config():
+#     return [
+#         triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_stages=1, num_warps=1),
 
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=1, num_warps=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_stages=1, num_warps=1),
 
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=1, num_warps=1),
 
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 16}, num_stages=1, num_warps=1),
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=1, num_warps=1),
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=1, num_warps=1),
-    ]
+#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 16}, num_stages=1, num_warps=1),
+#         # triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=1, num_warps=1),
+#         # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+#     ]
 
-values = {"has_exception": False}
-
-
-def _post_hook(*args, exception):
-    if exception is not None:
-        values["has_exception"] = True
-        # print(f">> Exception occurred: {exception}")
+# values = {"has_exception": False}
 
 
-@triton.autotune(
-    configs=get_autotune_config(),
-    key=['Z', 'H', 'N_CTX', 'HEAD_DIM'],  # 加入 shape 相关的关键参数
-    post_hook=_post_hook,
-)
+# def _post_hook(*args, exception):
+#     if exception is not None:
+#         print(f">> Triton kernel exception: {exception}")
+#         values["has_exception"] = True
+
+
+# @triton.autotune(
+#     configs=get_autotune_config(),
+#     key=['Z', 'H', 'N_CTX', 'HEAD_DIM'],  # 加入 shape 相关的关键参数
+#     post_hook=_post_hook,
+# )
+
+# We don't run auto-tuning every time to keep the tutorial fast. Keeping
+# the code below and commenting out the equivalent parameters is convenient for
+# re-tuning.
+configs = [
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+    for BM in [64, 128]\
+    for BN in [32, 64]\
+    for s in ([1] if is_hip() else [3, 4, 7])\
+    for w in [4, 8]\
+]
+
+
+def keep(conf):
+    BLOCK_M = conf.kwargs["BLOCK_M"]
+    BLOCK_N = conf.kwargs["BLOCK_N"]
+    if BLOCK_M * BLOCK_N < 128 * 64 and conf.num_warps == 8:
+        return False
+    return True
+
+
+@triton.autotune(list(filter(keep, configs)), key=['Z', 'H', 'N_CTX', 'HEAD_DIM'])
 @triton.jit
 def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
               stride_qz, stride_qh, stride_qm, stride_qk,  #
@@ -297,7 +320,7 @@ class _attention(torch.autograd.Function):
         # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+        # assert HEAD_DIM_K in {16, 32, 64, 128, 256} # 注释该信息
         o = torch.empty_like(q)
         stage = 3 if causal else 1
         extra_kern_args = {}
@@ -514,7 +537,8 @@ def pytest_generate_tests(metafunc):
             # "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_test.xls"),
             # "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result.xls"),
             # "step64+7": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result.xls"),
-            "extract": os.path.join(RESULT_DIR, "extract_test_case_prof.xlsx"),
+            # "extract": os.path.join(RESULT_DIR, "extract_test_case_prof.xlsx"),
+            "retest": os.path.join(TEST_DATA_DIR, "space_retest_gpu.xlsx"),
         }
         extract_map = {
             "From": "From",
@@ -538,27 +562,41 @@ def pytest_generate_tests(metafunc):
         
 
         # 提取测试数据
-        test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=True, sampling_rows=128,
-                                           insert_row={"D": D_FANHUA_LIST})
+        # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=False, sampling_rows=128,
+        #                                    insert_row={"D": D_FANHUA_LIST})
+        # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data)
 
-        test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
-        # 确保只对 test_case 参数化一次
-        metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
+        # test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
+        # # 确保只对 test_case 参数化一次
+        # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
 
-        # # 非测试文件的测试案例
-        # test_cases = [
-        #     # [1, 24, 9792, 64, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
-        #     [4, 32, 128, 128, False, torch.float16, 64, 128, "cv融合", "FlashAttentionScore_BNSD_1", 0],
-        #     [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
-        #     [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
-        #     [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
-        #     [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
-        #     [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
-        #     [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0],
-        #     [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0],
+        # 非测试文件的测试案例
+        test_cases = [
+            # [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
+            [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
+            [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
+            [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
+            [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
+            [2, 8, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "LLaMa_RealCase_0007", 0],
+            [1, 12, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0001", 0],
+            [1, 12, 4096, 128, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0002", 0],
+            [1, 4, 4096, 256, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0003", 0],
+            [1, 8, 8192, 128, False, torch.bfloat16, 64, 64, "模型规格", "TongYiQianWen_RealCase_0001", 0],
+            [1, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_173", 0],
+            [1, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_174", 0],
+            [2, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_175", 0],
+            [2, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_176", 0],
+            [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
+            [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
+            [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
+            [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
+            [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
+            [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
+            [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0],
+            [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0],
 
-        # ]
-        # metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
+        ]
+        metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
 
 
 def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
@@ -569,9 +607,9 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
     print(f"\n======  Running: {From}-{test_name} || B={B}, N1={N1}, S1={S1}, D={D}, causal={causal}, dtype={dtype}  ======\n")
     torch.manual_seed(20)
     # 创建输入张量 BNSD
-    q = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    q = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
+    k = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
+    v = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
 
     sm_scale = 0.5
     try:
@@ -593,7 +631,8 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
         #  ==== triton kernel 精度测试 ====
 
         def profiling_forward_fn():
-            attention(q, k, v, causal, sm_scale)
+            with torch.no_grad():
+                attention(q, k, v, causal, sm_scale)
 
         # ==== triton kernel 性能测试 ====
         kernel_avg_time = do_bench(profiling_forward_fn, keep_res=False, rep=20)
@@ -638,6 +677,13 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
         })
         print(f"Test case [{From}-{test_name}] failed with exception: {e}")
         pytest.fail(f"Test failed with exception [{From}-{test_name}]: {e}")
+    finally:
+        # 显式删除张量，释放计算图
+        del q, k, v
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.empty_cache()
 
 
 def collect_single(base_dir: str, key: str = None) -> float:
@@ -750,9 +796,9 @@ def do_bench_npu(fn, warmup=5, active=30, prof_dir=None, keep_res=False):
         for _ in range(total):
             fn()
             prof.step()
-
-    torch.npu.synchronize()
+            torch.npu.synchronize()
     time = collect_single(torch_path)
+    del prof
 
     if not keep_res:
         import shutil
@@ -789,6 +835,7 @@ def do_bench_gpu(fn, warmup=5, active=30):
         torch.cuda.synchronize()
 
     times = parse_prof(prof)
+    del prof
 
     return times
 
