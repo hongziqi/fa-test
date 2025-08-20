@@ -1,0 +1,5 @@
+.pytest_cache/
+__pycache__/
+test_data/
+test_results/
+fusion_results.json
