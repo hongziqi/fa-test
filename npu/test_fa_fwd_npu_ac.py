@@ -196,14 +196,34 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     return acc, l_i, m_i
 
 
+# def get_autotune_config():
+#     return [
+#         triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_stages=1, num_warps=1),
+
+#         triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_stages=1, num_warps=1),
+
+#         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+
+#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 16}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+#     ]
+
+# values = {"has_exception": False}
+
+
+# def _post_hook(*args, exception):
+#     if exception is not None:
+#         values["has_exception"] = True
+#         # print(f">> Exception occurred: {exception}")
+
+
 # @triton.autotune(
-#     configs=[
-#         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}),
-#         triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}),
-#         triton.Config({"BLOCK_M": 64, "BLOCK_N": 256}),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}),
-#     ],
-#     key=["N_CTX", "HEAD_DIM"]
+#     configs=get_autotune_config(),
+#     key=['Z', 'H', 'N_CTX', 'HEAD_DIM'],  # 加入 shape 相关的关键参数
+#     post_hook=_post_hook,
 # )
 @triton.jit
 def _attn_fwd(Q, K, V, M, Out, sm_scale,  #
