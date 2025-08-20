@@ -95,6 +95,7 @@ from typing import Dict, Tuple, Optional, Any, Union, List
 DEVICE = "cuda"
 TEST_DATA_DIR = "./test_data"
 RESULT_DIR = "./test_results"
+RESULT_DIR = "./test_results_batch"
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 import os
@@ -533,12 +534,12 @@ def pytest_generate_tests(metafunc):
         paths = {
             # "prof01": os.path.join(TEST_DATA_DIR, "prof_case_274.xlsx"),
             # "prof01": os.path.join(TEST_DATA_DIR, "prof_case_all.xlsx"),
-            # "prof01": os.path.join(TEST_DATA_DIR, "prof_case_test_gpu.xlsx"),
+            "prof01": os.path.join(TEST_DATA_DIR, "prof_case_test_gpu.xlsx"),
             # "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_test.xls"),
             # "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result.xls"),
             # "step64+7": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result.xls"),
             # "extract": os.path.join(RESULT_DIR, "extract_test_case_prof.xlsx"),
-            "retest": os.path.join(TEST_DATA_DIR, "space_retest_gpu.xlsx"),
+            # "retest": os.path.join(TEST_DATA_DIR, "space_retest_gpu.xlsx"),
         }
         extract_map = {
             "From": "From",
@@ -564,39 +565,50 @@ def pytest_generate_tests(metafunc):
         # 提取测试数据
         # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=False, sampling_rows=128,
         #                                    insert_row={"D": D_FANHUA_LIST})
-        # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data)
+        test_data = extract_test_case_data(paths, extract_map, new_field, filter_data)
 
-        # test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
-        # # 确保只对 test_case 参数化一次
+        test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
+
+        # （全量）确保只对 test_case 参数化一次
         # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
 
-        # 非测试文件的测试案例
-        test_cases = [
-            # [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
-            [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
-            [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
-            [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
-            [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
-            [2, 8, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "LLaMa_RealCase_0007", 0],
-            [1, 12, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0001", 0],
-            [1, 12, 4096, 128, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0002", 0],
-            [1, 4, 4096, 256, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0003", 0],
-            [1, 8, 8192, 128, False, torch.bfloat16, 64, 64, "模型规格", "TongYiQianWen_RealCase_0001", 0],
-            [1, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_173", 0],
-            [1, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_174", 0],
-            [2, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_175", 0],
-            [2, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_176", 0],
-            [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
-            [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
-            [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
-            [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
-            [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
-            [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
-            [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0],
-            [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0],
+        # （分批）对 test_case 参数化
+        # 选择当前批次的测试案例
+        start_index = metafunc.config.getoption("start_index")
+        batch_size = metafunc.config.getoption("batch_size")
+        end_index = min(start_index + batch_size, len(test_cases))
+        batch_cases = test_cases[start_index:end_index]
+        print(f">>> Running test batch: {start_index} to {end_index-1} ({len(batch_cases)} cases)")
+        metafunc.parametrize("test_case", batch_cases, 
+                            ids=[f"{case['From']}_{case['Testcase Name']}" for case in batch_cases])
 
-        ]
-        metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
+        # 非测试文件的测试案例
+        # test_cases = [
+        #     # [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
+        #     [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
+        #     [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
+        #     [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
+        #     [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
+        #     [2, 8, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "LLaMa_RealCase_0007", 0],
+        #     [1, 12, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0001", 0],
+        #     [1, 12, 4096, 128, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0002", 0],
+        #     [1, 4, 4096, 256, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0003", 0],
+        #     [1, 8, 8192, 128, False, torch.bfloat16, 64, 64, "模型规格", "TongYiQianWen_RealCase_0001", 0],
+        #     [1, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_173", 0],
+        #     [1, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_174", 0],
+        #     [2, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_175", 0],
+        #     [2, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_176", 0],
+        #     [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
+        #     [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
+        #     [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
+        #     [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
+        #     [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
+        #     [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
+        #     [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0],
+        #     [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0],
+
+        # ]
+        # metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
 
 
 def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
@@ -683,6 +695,8 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
         # 强制Python垃圾回收
         import gc
         gc.collect()
+        # 额外延迟确保NPU完全重置
+        time.sleep(1)
 
 
 def collect_single(base_dir: str, key: str = None) -> float:
@@ -754,8 +768,6 @@ def do_bench_npu(fn, warmup=5, active=30, prof_dir=None, keep_res=False):
     import torch_npu
     from datetime import datetime, timezone
 
-    torch.npu.empty_cache()
-
     # warmup kernel
     fn()
     torch.npu.synchronize()
@@ -811,8 +823,6 @@ def do_bench_npu(fn, warmup=5, active=30, prof_dir=None, keep_res=False):
 
 def do_bench_gpu(fn, warmup=5, active=30):
     from datetime import datetime, timezone
-
-    torch.cuda.empty_cache()
 
     # warmup kernel
     fn()
