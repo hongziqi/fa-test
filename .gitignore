@@ -3,3 +3,7 @@ __pycache__/
 test_data/
 test_results/
 fusion_result.json
+
+kernel_meta/
+
+*.log
