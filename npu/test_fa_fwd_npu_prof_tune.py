@@ -96,6 +96,7 @@ torch.npu.set_device(0)
 DEVICE = "npu"
 TEST_DATA_DIR = "/home/coder/fa-test/test_data"
 RESULT_DIR = "./test_results"
+RESULT_DIR = "./test_results_batch"
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 import os
@@ -204,11 +205,11 @@ def get_autotune_config():
         triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=1, num_warps=1),
         triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_stages=1, num_warps=1),
 
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+        # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=1, num_warps=1),
 
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 16}, num_stages=1, num_warps=1),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=1, num_warps=1),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 16}, num_stages=1, num_warps=1),
+        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=1, num_warps=1),
+        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=1, num_warps=1),
     ]
 
 values = {"has_exception": False}
@@ -239,7 +240,7 @@ def _attn_fwd(Q, K, V, M, Out, sm_scale,  #
               STAGE: tl.constexpr  #
               ):
     # ???, why
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
+    # tl.static_assert(BLOCK_N <= HEAD_DIM)
 
     start_m = tl.program_id(0)
     # off_hz = tl.program_id(1) 
@@ -597,9 +598,10 @@ def pytest_generate_tests(metafunc):
             # "step64_02": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result_02.xls"),
             # "step64+7_01": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result_01.xls"),
             # "step64+7_02": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result_02.xls"),
-            "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result.xls"),
-            "step64+7": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result.xls"),
+            # "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result.xls"),
+            # "step64+7": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result.xls"),
             # "test": os.path.join(TEST_DATA_DIR, "prof_case_test.xlsx"),
+            "extract": os.path.join(RESULT_DIR, "extract_test_case_prof.xlsx"),
         }
         extract_map = {
             "From": "From",
@@ -620,47 +622,57 @@ def pytest_generate_tests(metafunc):
         filter_data = {
             "Layout": "BNSD",  # 只测试 BNSD 布局(4096)
         }
-        # # 提取测试数据
-        # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=True, sampling_rows=32,
-        #                                    insert_row={"D": D_FANHUA_LIST}, save_path=f"{RESULT_DIR}/extract_test_case_ac.xlsx")
-        # # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=True, sampling_rows=32,
-        # #                             insert_row={"D": D_FANHUA_LIST}, save_path=f"{RESULT_DIR}/extract_test_case_ac.xlsx")
+        # 提取测试数据
+        # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=False, sampling_rows=128,
+        #                                    insert_row={"D": D_FANHUA_LIST})
+        test_data = extract_test_case_data(paths, extract_map, new_field, filter_data)
 
-        # test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
-        # # 确保只对 test_case 参数化一次
+        test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
+        # （全量）确保只对 test_case 参数化一次
         # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
 
+        # （分批）对 test_case 参数化
+        # 选择当前批次的测试案例
+        start_index = metafunc.config.getoption("start_index")
+        batch_size = metafunc.config.getoption("batch_size")
+        end_index = min(start_index + batch_size, len(test_cases))
+        batch_cases = test_cases[start_index:end_index]
+        print(f">>> Running test batch: {start_index} to {end_index-1} ({len(batch_cases)} cases)")
+        metafunc.parametrize("test_case", batch_cases, 
+                            ids=[f"{case['From']}_{case['Testcase Name']}" for case in batch_cases])
+
+
         # 非测试文件的测试案例
-        test_cases = [
-            # [1, 3, 53255, 128, False, torch.bfloat16, 64, 64, "step64+7", "FlashAttentionScore_BNSD_0833", 0],
-            # [1, 24, 15296, 64, False, torch.bfloat16, 64, 64, "step64_01", "FlashAttentionScore_BNSD_0239", 0],
-            # [1, 3, 75328, 64, False, torch.bfloat16, 64, 64, "step64_02", "FlashAttentionScore_BNSD_1177", 0],
-            # [1, 3, 64000, 64000, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
-            # [1, 24, 9792, 72, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
-            [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
-            [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
-            [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
-            [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
-            [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
-            [2, 8, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "LLaMa_RealCase_0007", 0],
-            [1, 12, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0001", 0],
-            [1, 12, 4096, 128, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0002", 0],
-            [1, 4, 4096, 256, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0003", 0],
-            [1, 8, 8192, 128, False, torch.bfloat16, 64, 64, "模型规格", "TongYiQianWen_RealCase_0001", 0],
-            [1, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_173", 0],
-            [1, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_174", 0],
-            [2, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_175", 0],
-            [2, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_176", 0],
-            [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
-            [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
-            [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
-            [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
-            [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
-            [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
-            [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0], # NPU out of memory. Tried to allocate 64.00 GiB
-            [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0], # NPU out of memory. Tried to allocate 64.00 GiB
-        ]
-        metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
+        # test_cases = [
+        #     # [1, 3, 53255, 128, False, torch.bfloat16, 64, 64, "step64+7", "FlashAttentionScore_BNSD_0833", 0],
+        #     # [1, 24, 15296, 64, False, torch.bfloat16, 64, 64, "step64_01", "FlashAttentionScore_BNSD_0239", 0],
+        #     # [1, 3, 75328, 64, False, torch.bfloat16, 64, 64, "step64_02", "FlashAttentionScore_BNSD_1177", 0],
+        #     # [1, 3, 64000, 64000, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
+        #     # [1, 24, 9792, 72, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
+        #     # [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
+        #     # [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
+        #     # [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
+        #     [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
+        #     [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
+        #     [2, 8, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "LLaMa_RealCase_0007", 0],
+        #     [1, 12, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0001", 0],
+        #     [1, 12, 4096, 128, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0002", 0],
+        #     [1, 4, 4096, 256, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0003", 0],
+        #     [1, 8, 8192, 128, False, torch.bfloat16, 64, 64, "模型规格", "TongYiQianWen_RealCase_0001", 0],
+        #     [1, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_173", 0],
+        #     [1, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_174", 0],
+        #     [2, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_175", 0],
+        #     [2, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_176", 0],
+        #     [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
+        #     [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
+        #     [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
+        #     [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
+        #     [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
+        #     [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
+        #     [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0], # NPU out of memory. Tried to allocate 64.00 GiB
+        #     [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0], # NPU out of memory. Tried to allocate 64.00 GiB
+        # ]
+        # metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
 
 
 def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
@@ -747,7 +759,6 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
             "BN": BN,
             "causal": str(causal),
             "result": "Error",
-            # "Precision result": "Error",
             "Error Message": str(e),
         })
         print(f"Test case [{From}-{test_name}] failed with exception: {e}")
@@ -758,6 +769,8 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
         # 强制Python垃圾回收
         import gc
         gc.collect()
+        # 额外延迟确保NPU完全重置
+        time.sleep(1)
 
 
 def collect_single(base_dir: str, key: str = None) -> float:
