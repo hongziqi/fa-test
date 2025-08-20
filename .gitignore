@@ -2,4 +2,4 @@
 __pycache__/
 test_data/
 test_results/
-fusion_results.json
+fusion_result.json
