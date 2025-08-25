@@ -169,8 +169,9 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 
         # p = tl.math.exp2(qk)
         p = tl.math.exp(qk)
-        p_cast = p.to(tl.float16)
+        # p_cast = p.to(tl.float16)
         v = tl.load(V_block_ptr)
+        p_cast = p.to(v.dtype)  # fix to bf16: tl.dot(p_cast, v) -> Got fp16 and bf16
 
         pv = tl.dot(p_cast, v)
         l_ij = tl.sum(p, 1)
@@ -653,7 +654,7 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
     sm_scale = 0.5
     try:
         # triton kernel
-        tri_out = attention(q, k, v, causal, sm_scale, BM, BN).half()
+        tri_out = attention(q, k, v, causal, sm_scale, BM, BN)
 
         # M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))
         # p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
@@ -798,7 +799,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype, BM, BN):
         stream.synchronize()
         prof.step()
         for i in range(LOOP + 2):
-            tri_out = attention(q, k, v, causal, sm_scale, BM, BN).half()
+            tri_out = attention(q, k, v, causal, sm_scale, BM, BN)
             prof.step()
             if i == 0:
                 stream.synchronize()
@@ -977,4 +978,4 @@ def parse_prof(prof):
 
 
 if __name__ == "__main__":
-    test_op(4, 32, 2048, 64, False, torch.float16, 128, 256)
+    test_op(4, 32, 2048, 64, False, torch.bfloat16, 128, 256)
