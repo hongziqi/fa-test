@@ -1,0 +1,980 @@
+"""
+=========== FA Triton Kernel 泛化性测试 ===========
+已知 测试 表格: 
+  FlashAttentionScore_step64_case_d64_Result.xls 
+  FlashAttentionScore_step64+7_case_d64_Result.xls
+
+>> 每一行代表一个测试用例，包含以下字段(共78个)及示例内容：
+Group: FlashAttentionScore
+Testcase Name: FlashAttentionScore_BNSD_{num} / FlashAttentionScore_BSH_{num}
+Enable: disable/onlypref
+Level: level0
+Network Type: fanhua
+B: 1                    #
+N1: 24
+N2: 3
+S1: 64
+S2: 64
+D: 64
+Dtype: bf16
+sparse mode: 0
+pre tockens: 65536
+next tockens: 65536
+Layout: BNSD / BSH
+PSE: None
+pse type: None
+Atten mask Dtype: None
+Atten mask Shape: None
+Padding Mask: None
+keep prob: 1
+Expect out pricision: 
+Expect out err max: 
+Expect out err sum: 
+Expect out eb: 
+Expect dp pricision: 
+Actual out pricision: 0
+Actual out err max: 0
+Actual out err sum: 0
+Actual out eb: 0
+Actual dp pricision: 0
+Actual dp err max: 0
+Actual dp err sum: 0
+Actual dp eb: 0
+Actual dk pricision: 0
+Actual dk err max: 0
+Actual dk err sum: 0
+Actual dk eb: 0
+Actual dv pricision: 0
+Actual dv err max: 0
+Actual dv err sum: 0
+Actual dv eb: 0
+Actual Memory: 0
+Actual kernel time forward: 0.0316
+Actual kernel time backward: 0.0979
+Actual e2e time forward: 0
+Actual e2e time backward: 0
+Precision result: Fail
+Rmse result: Pass
+Rme result: Pass
+EB result: 
+Performance result: Fail
+Memory result: Fail
+running status: PASS
+Actual kernel time forward transpose: 0.0694
+Actual kernel time backward transpose: 0.5471
+Actual kernel time forward pad: 0
+Actual kernel time backward pad: 0.0000
+Actual kernel time forward slice: 0
+Actual kernel time backward slice: 0.0000
+Actual kernel time forward gpu:
+Actual kernel time backward gpu:
+BNSD+transpose: 0.1010
+>>
+任务描述：基于表格数据驱动 test_op_fwd, 完成泛化性测试（精度+性能）。
+精度测试：直接 NPU 侧对比 ref_out 和 tri_out 的结果。
+性能测试：与 GPU 侧对比，计算 kernel_time 和 e2e_time。
+最终目的：泛化性验证 FlashAttentionScore 的精度和性能。
+=========== FA Triton Kernel 泛化性测试 ===========
+"""
+
+import pytest
+import torch
+import torch_npu
+import triton
+import triton.language as tl
+import os
+import re
+import time
+import pandas as pd
+import subprocess
+import multiprocessing
+from typing import Dict, Tuple, Optional, Any, Union, List
+
+
+torch.npu.set_device(0)
+# ========== 全局变量和常量 ==========
+DEVICE = "npu"
+TEST_DATA_DIR = "/home/coder/fa-test/test_data"
+RESULT_DIR = "./test_results"
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+import os
+os.environ["TRITON_BENCH_METHOD"] = "npu" # 设置为 NPU 测试方法
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1" # 打印自动调优信息
+
+test_results = []  # 全局结果存储
+valid_fields = ["B", "N1", "S1", "D", "causal", "dtype", "BM", "BN", "From", "Testcase Name", "sparse mode"]
+dtype_map = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': torch.float32, 
+             'float16': torch.float16, 'bfloat16': torch.bfloat16, 'float32': torch.float32,
+             'torch.bfloat16': torch.bfloat16, 'torch.float16': torch.float16, 'torch.float32': torch.float32}
+
+# D 泛化列表
+D_FANHUA_LIST = [64, 72, 80, 88, 96, 128, 256]
+
+# ========== Triton Kernel 实现（保持不变） ==========
+def is_hip():
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
+
+
+@triton.jit
+def _attn_fwd_inner(acc, l_i, m_i, q,  #
+                    K_block_ptr, V_block_ptr,  #
+                    start_m, qk_scale,  #
+                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
+                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
+                    N_CTX: tl.constexpr, fp8_v: tl.constexpr):
+    # range of values handled by this stage
+    # causal = true
+    # stage = 1
+    # 因果注意力，顾名思义，它在计算时会限制信息的流动，只允许模型看到当前位置及之前的位置
+    # 的信息。也就是说，当前位置的输出只能依赖于该位置及其之前的输入，而不能访问当前位置
+    # 之后的信息。因果注意力保证了数据的顺序性，避免了“未来信息”的泄露。
+    # 但是后面的逻辑也会触发
+    if STAGE == 1:
+        tl.static_assert(BLOCK_M >= BLOCK_N)
+        lo, hi = 0, start_m * BLOCK_M
+    elif STAGE == 2:
+        tl.static_assert(BLOCK_M >= BLOCK_N)
+        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+        lo = tl.multiple_of(lo, BLOCK_M)
+    # causal = False
+    else:
+        lo, hi = 0, N_CTX
+    # k 之前的版本，随路做转置的版本
+    #K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    
+    # 修改后不转的版本
+    K_block_ptr = tl.advance(K_block_ptr, (lo, 0))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    # loop over k, v and update accumulator
+    for start_n in range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # -- compute qk ----
+        k = tl.load(K_block_ptr)
+        
+        # 修改K
+        trans_k = tl.trans(k)
+        qk = tl.dot(q, trans_k)
+        # ------------------------------
+
+        if STAGE == 2:
+            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk -= m_ij[:, None]
+        else:
+            qk = qk * qk_scale
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk -= m_ij[:, None]
+
+        # p = tl.math.exp2(qk)
+        p = tl.math.exp(qk)
+        p_cast = p.to(tl.float16)
+        v = tl.load(V_block_ptr)
+
+        pv = tl.dot(p_cast, v)
+        l_ij = tl.sum(p, 1)
+        # -- update m_i and l_i
+        alpha = tl.math.exp(m_i - m_ij)
+        # alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        # -- update output accumulator --
+        acc = acc * alpha[:, None] + pv
+  
+        # update m_i and l_i
+        m_i = m_ij
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (BLOCK_N, 0))
+    return acc, l_i, m_i
+
+
+# def get_autotune_config():
+#     return [
+#         triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_stages=1, num_warps=1),
+
+#         triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_stages=1, num_warps=1),
+
+#         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+
+#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 16}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+#     ]
+
+# values = {"has_exception": False}
+
+
+# def _post_hook(*args, exception):
+#     if exception is not None:
+#         values["has_exception"] = True
+#         # print(f">> Exception occurred: {exception}")
+
+
+# @triton.autotune(
+#     configs=get_autotune_config(),
+#     key=['Z', 'H', 'N_CTX', 'HEAD_DIM'],  # 加入 shape 相关的关键参数
+#     post_hook=_post_hook,
+# )
+@triton.jit
+def _attn_fwd(Q, K, V, M, Out, sm_scale,  #
+              stride_qz: tl.constexpr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qk: tl.constexpr,  #
+              stride_kz: tl.constexpr, stride_kh: tl.constexpr, stride_kn: tl.constexpr, stride_kk: tl.constexpr,  #
+              stride_vz: tl.constexpr, stride_vh: tl.constexpr, stride_vn: tl.constexpr, stride_vk: tl.constexpr,  #
+              stride_oz: tl.constexpr, stride_oh: tl.constexpr, stride_om: tl.constexpr, stride_on: tl.constexpr,  #
+              Z: tl.constexpr, H: tl.constexpr, 
+              N_CTX: tl.constexpr,  #
+              HEAD_DIM: tl.constexpr,  #
+              BLOCK_M: tl.constexpr,  #
+              BLOCK_N: tl.constexpr,  #
+              STAGE: tl.constexpr,  #
+              NUM_BLOCKS_PER_CORE: tl.constexpr,
+              NUM_BLOCKS: tl.constexpr,
+              NUM_BLOCKS_M: tl.constexpr,
+              ):
+    # ???, why
+    # tl.static_assert(BLOCK_N <= HEAD_DIM)
+    pid = tl.program_id(0)
+    block_start = pid * NUM_BLOCKS_PER_CORE
+    NUM_BLOCKS_hz = NUM_BLOCKS // NUM_BLOCKS_M
+    task_m_idx = 0
+    task_hz_idx = 0
+
+    for block_idx in range(pid, NUM_BLOCKS, 20):
+        task_hz_idx = block_idx // NUM_BLOCKS_M
+        task_m_idx = block_idx % NUM_BLOCKS_M
+        off_z = task_hz_idx // H
+        off_h = task_hz_idx % H
+        qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+        Q_block_ptr = tl.make_block_ptr(
+            base=Q + qvk_offset,
+            # doesn't matter
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_qm, stride_qk),
+
+            offsets=(task_m_idx * BLOCK_M, 0),
+            block_shape=(BLOCK_M, HEAD_DIM),
+
+            # doesn't matter
+            order=(1, 0),
+        )
+        V_block_ptr = tl.make_block_ptr(
+            base=V + qvk_offset,
+
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_vn, stride_vk),
+
+            offsets=(0, 0),
+            # why block_n??
+            block_shape=(BLOCK_N, HEAD_DIM),
+            order=(1, 0),
+        )
+        K_block_ptr = tl.make_block_ptr(
+            base=K + qvk_offset,
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_kn, stride_kk),
+            offsets=(0, 0),
+            block_shape=(BLOCK_N, HEAD_DIM),
+            order=(1, 0),
+        )
+        O_block_ptr = tl.make_block_ptr(
+            base=Out + qvk_offset,
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_om, stride_on),
+            offsets=(task_m_idx * BLOCK_M, 0),
+            block_shape=(BLOCK_M, HEAD_DIM),
+            order=(1, 0),
+        )
+        # initialize offsets
+        offs_m = task_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+
+        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        # load scales
+
+        # load q: it will stay in SRAM throughout
+        q = tl.load(Q_block_ptr)
+        # stage 1: off-band
+        # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
+        # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
+
+        if STAGE & 1:
+            acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
+                                            task_m_idx, sm_scale,  #
+                                            BLOCK_M, HEAD_DIM, BLOCK_N,  #
+                                            4 - STAGE, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
+                                            )
+        # stage 2: on-band
+
+        if STAGE & 2:
+            # barrier makes it easier for compielr to schedule the
+            # two loops independently
+            acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
+                                            task_m_idx, sm_scale,  #
+                                            BLOCK_M, HEAD_DIM, BLOCK_N,  #
+                                            2, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
+                                            )
+        # epilogue
+        # m_i += tl.math.log2(l_i)
+        m_i += tl.math.log(l_i)
+        acc = acc / l_i[:, None]
+        m_ptrs = M + task_hz_idx * N_CTX + offs_m
+
+        tl.store(m_ptrs, m_i)
+        tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+
+
+class _attention(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, q, k, v, causal, sm_scale, BM, BN):
+        # shape constraints
+        HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+        # when v is in float8_e5m2 it is transposed.
+        HEAD_DIM_V = v.shape[-1]
+        assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
+        # assert HEAD_DIM_K in {16, 32, 64, 128, 256}  // 注释用于泛化测试 HEAD_DIM_K
+
+        o = torch.empty_like(q)
+
+        # stage = 3
+        stage = 3 if causal else 1
+        extra_kern_args = {}
+        # Tuning for AMD target
+        # if is_hip():
+        #     waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
+        #     extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
+        num_cores = 20
+        NUM_BLOCKS_M = triton.cdiv(q.shape[2], BM)
+        NUM_BLOCKS = NUM_BLOCKS_M * q.shape[0] * q.shape[1]
+        NUM_BLOCKS_PER_CORE = triton.cdiv(NUM_BLOCKS, num_cores)
+        # grid = lambda args: (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+        # grid = (triton.cdiv(q.shape[2], BM),1, 1)
+        # (1, 2, 1024)
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        _attn_fwd[(num_cores,)](
+            q, k, v, M, o, sm_scale, #
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
+            q.shape[0], q.shape[1], N_CTX=q.shape[2],  # why varidic??
+            HEAD_DIM=HEAD_DIM_K,  # 64
+            BLOCK_M = BM, # 32
+            BLOCK_N = BN, # 32
+            STAGE=stage,
+            NUM_BLOCKS_PER_CORE=NUM_BLOCKS_PER_CORE,
+            NUM_BLOCKS=NUM_BLOCKS,
+            NUM_BLOCKS_M=NUM_BLOCKS_M,
+            debug=True,
+            multibuffer=True, # autotune config, 控制开double buffer
+            unit_flag=True, # autotune config, cube搬出的一个优化项
+            nested_sub_block_num=4, # autotune config, vector 切分的一个参数，最好是2的幂次，【2,4,8,16】-》BM，硬件单元是2个vector核一组，bm/2 -> for #e.g. bm=128, per core 64, 实际行为 for 4，每次 16
+            limit_auto_multi_buffer_only_for_local_buffer=False, # autotune config, 是否开启cube和vector的并行，false表示开启
+            set_workspace_multibuffer=4, # autotune config, 表示同时cube和vector有几个并行，【2,4】，仅limit_auto_multi_buffer_only_for_local_buffer=False 时生效
+            **extra_kern_args)
+
+
+        ctx.save_for_backward(q, k, v, o, M)
+        # ctx.grid = grid
+        ctx.sm_scale = sm_scale
+        ctx.HEAD_DIM = HEAD_DIM_K
+        ctx.causal = causal
+        return o
+
+
+attention = _attention.apply
+# ========== Triton Kernel 实现（保持不变） ==========
+
+
+def normalize_col_name(col: str) -> str:
+    """
+    标准化列名：去除非字母数字字符，转小写
+    """
+    return re.sub(r'[\s_\-]+', '', str(col).strip().lower())
+
+
+def standardize_dataframe_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    """
+    根据 mapping 字典（原始列名 -> 目标字段名），标准化 DataFrame 的列名。
+    :param df: 原始 DataFrame
+    :param mapping: 原始列名（任意格式） -> 目标字段名（如 "Z", "H"）
+    :return: 列名已标准化的 DataFrame
+    """
+    # 创建标准化后的列名到原始列名的映射
+    normalized_to_raw = {normalize_col_name(col): col for col in df.columns}
+    
+    # 查找 mapping 中每个期望列名的实际列
+    rename_dict = {}
+    missing = []
+    for raw_name, target_name in mapping.items():
+        normalized_key = normalize_col_name(raw_name)
+        if normalized_key in normalized_to_raw:
+            actual_col = normalized_to_raw[normalized_key]
+            rename_dict[actual_col] = target_name
+        else:
+            missing.append(raw_name)
+    
+    if missing:
+        print(f"文件中缺失列: {missing}")
+    
+    # 重命名并返回
+    return df.rename(columns=rename_dict)
+
+
+def extract_test_case_data(
+        paths: Dict[str, str],
+        extract_map: Dict[str, str],
+        new_field: Optional[Dict[str, Any]] = None,
+        filter_data: Optional[Dict[str, Any]] = None,
+        sampling: bool = False,
+        sampling_rows: int = 128,
+        insert_row: Optional[Dict[str, Any]] = None,
+        save_path: Optional[str] = None
+    ) -> pd.DataFrame:
+    """
+    从多个 Excel 文件中提取测试用例数据。
+    :param paths: 多个文件路径, 例如 {"file1": "path/to/file1", "file2": "path/to/file2"}
+    :param extract_map: 提取字段映射
+    :param new_field: 新字段及其值, 例如 {"new_field": "value"}
+    :param filter_data: 可选的过滤条件，字典形式，键为字段名，值为期望的值
+    :param sampling: 是否进行采样，默认为 True
+    :param sampling_rows: 采样行数，默认为 128
+    :param insert_row: 基于原来案例+需改变的字段，插入新的测试数据, 例如{"D": [64, 72, 80, 88, 96, 128, 256]}, 即每个 D 值都生成一个新的测试案例
+    :param save_path: 可选的保存路径，如果提供则将结果保存为 Excel 文件
+    :return: 提取的测试用例数据
+    Example:
+    paths = {
+        "64": "FlashAttentionScore_step64_case_d64_Result.xls",
+        "7": "FlashAttentionScore_step64+7_case_d64_Result.xls"
+    }
+    extract_map = {
+        "Testcase Name": "Testcase Name",
+        "Level": "Level",
+        "Network Type": "Network Type",
+        "B": "Z",
+        "N1": "H",
+        "S1": "N_CTX",
+        "D": "HEAD_DIM",
+        "Dtype": "dtype",
+        "sparse mode": "sparse_mode",
+        "Layout": "Layout",
+        # 其他需要提取的字段...
+    }
+    new_field = {
+        "BM": 32,
+        "BN": 32,
+        "causal": False,
+    }
+    """
+    # 临时设置显示选项
+    pd.set_option('display.max_columns', None)        # 显示所有列
+    pd.set_option('display.width', None)              # 自动换行
+    pd.set_option('display.max_colwidth', 50)         # 列宽足够
+    dfs = []
+    for key, path in paths.items():
+        df = pd.read_excel(path)
+        # 检查是否有From列，如果没有则添加
+        if 'From' not in df.columns:
+            df.insert(0, 'From', key)
+        df_std = standardize_dataframe_columns(df, extract_map)
+        dfs.append(df_std)
+    if not dfs:
+        raise ValueError("所有文件加载失败，请检查路径")
+
+    combined_df = pd.concat(dfs, ignore_index=True).fillna("")  # 合并所有 DataFrame
+
+    # 提取并重命名字段
+    target_cols = list(extract_map.values())
+    # 只保留 extract_map 中定义的目标字段
+    extracted_data = combined_df[target_cols].copy()
+
+    # 如果有新字段，添加到 DataFrame 中
+    if new_field:
+        for field, value in new_field.items():
+            extracted_data.loc[:, field] = value
+    # 映射数据类型
+    if 'dtype' in extracted_data.columns:
+        extracted_data.loc[:, 'dtype'] = extracted_data['dtype'].map(dtype_map)
+    # 确保 From 是首列
+    columns = ["From"] + [col for col in extracted_data.columns if col != "From"]
+    extracted_data = extracted_data[columns]
+    # 如果有过滤条件，应用过滤
+    if filter_data:
+        for key, value in filter_data.items():
+            if key in extracted_data.columns:
+                extracted_data = extracted_data[extracted_data[key] == value]
+            else:
+                print(f"警告: 过滤条件中的字段 '{key}' 在数据中不存在，跳过该过滤条件。")
+    # 抽样
+    if sampling and len(extracted_data) > sampling_rows:
+       # 保留首行，然后每隔 sampling_rows 行采样一行
+        idxs = [0] + [i for i in range(sampling_rows, len(extracted_data), sampling_rows)]
+        extracted_data = extracted_data.iloc[idxs].reset_index(drop=True)
+    # 如果有插入行，基于原来案例+需改变的字段，插入新的测试数据
+    if insert_row:
+        # 生成新的测试案例
+        new_rows = []
+        for _, row in extracted_data.iterrows():
+            for field, values in insert_row.items():
+                for value in values:
+                    new_row = row.to_dict()
+                    new_row[field] = value
+                    new_rows.append(new_row)
+        # 将新行添加到 DataFrame 中
+        extracted_data = pd.DataFrame(new_rows)
+    # 如果指定了保存路径，则保存到 Excel 文件
+    if save_path:
+        extracted_data.to_excel(save_path, index=False)
+        print(f"提取的数据已保存到 {save_path}")
+    # 展示前10行数据
+    # print("Extracted test cases (head):\n", extracted_data.head(10))
+    return extracted_data
+
+
+def precision_atol_rtol(dtype) -> Tuple[float, float]:
+    """
+    根据数据类型返回精度的绝对误差和相对误差
+    """
+    return {
+        torch.float16: (1e-3, 1e-3),
+        torch.bfloat16: (5e-3, 5e-3),
+        torch.float32: (1e-4, 1e-4),
+    }.get(dtype, (1e-4, 1e-4))
+
+
+def compute_errors(ref: torch.Tensor, tri: torch.Tensor) -> Dict[str, float]:
+    """
+    计算多种误差指标
+    """
+    diff = (ref - tri).abs()
+    return {
+        "err max": diff.max().item(),
+        "err sum": diff.sum().item(),
+        "err mean": diff.mean().item(),
+        "rmse": torch.sqrt((diff ** 2).mean()).item(),
+    }
+
+
+# 测试用例生成
+def pytest_generate_tests(metafunc):
+    """
+    pytest hook to generate test cases dynamically
+    """
+    if 'test_case' in metafunc.fixturenames:
+        # 生成测试用例数据
+        paths = {
+            # "step64_01": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result_01.xls"),
+            # "step64_02": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result_02.xls"),
+            # "step64+7_01": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result_01.xls"),
+            # "step64+7_02": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result_02.xls"),
+            "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result.xls"),
+            "step64+7": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result.xls"),
+            # "test": os.path.join(TEST_DATA_DIR, "prof_case_test.xlsx"),
+        }
+        extract_map = {
+            "From": "From",
+            "Testcase Name": "Testcase Name",
+            "B": "B",
+            "N1": "N1",
+            "S1": "S1",
+            "D": "D",
+            "Dtype": "dtype",
+            "sparse mode": "sparse mode",
+            "Layout": "Layout",
+        }
+        new_field = {
+            "BM": 64,
+            "BN": 64,
+            "causal": False,
+        }
+        filter_data = {
+            "Layout": "BNSD",  # 只测试 BNSD 布局(4096)
+        }
+        # # 提取测试数据
+        # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=True, sampling_rows=32,
+        #                                    insert_row={"D": D_FANHUA_LIST}, save_path=f"{RESULT_DIR}/extract_test_case_ac.xlsx")
+        # # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=True, sampling_rows=32,
+        # #                             insert_row={"D": D_FANHUA_LIST}, save_path=f"{RESULT_DIR}/extract_test_case_ac.xlsx")
+
+        # test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
+        # # 确保只对 test_case 参数化一次
+        # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
+
+        # 非测试文件的测试案例
+        test_cases = [
+            [1, 3, 53255, 128, False, torch.bfloat16, 64, 64, "step64+7", "FlashAttentionScore_BNSD_0833", 0],
+            # [1, 24, 15296, 64, False, torch.bfloat16, 64, 64, "step64_01", "FlashAttentionScore_BNSD_0239", 0],
+            # [1, 3, 75328, 64, False, torch.bfloat16, 64, 64, "step64_02", "FlashAttentionScore_BNSD_1177", 0],
+            # [1, 3, 64000, 64000, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
+            # [1, 24, 9792, 72, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
+            # [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
+            # [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
+            # [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
+            # [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
+            # [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
+            # [2, 8, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "LLaMa_RealCase_0007", 0],
+            # [1, 12, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0001", 0],
+            # [1, 12, 4096, 128, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0002", 0],
+            # [1, 4, 4096, 256, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0003", 0],
+            # [1, 8, 8192, 128, False, torch.bfloat16, 64, 64, "模型规格", "TongYiQianWen_RealCase_0001", 0],
+            # [1, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_173", 0],
+            # [1, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_174", 0],
+            # [2, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_175", 0],
+            # [2, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_176", 0],
+            # [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
+            # [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
+            # [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
+            # [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
+            # [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
+            # [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
+            # [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0], # NPU out of memory. Tried to allocate 64.00 GiB
+            # [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0], # NPU out of memory. Tried to allocate 64.00 GiB
+
+        ]
+        metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
+
+
+def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
+    if isinstance(test_case, list):
+        # 如果是列表，转换为字典
+        test_case = {k: v for k, v in zip(valid_fields, test_case)}
+    B, N1, S1, D, causal, dtype, BM, BN, From, test_name, sparse_mode = [test_case[k] for k in valid_fields]
+    print(f"\n======  Running: {From}-{test_name} || B={B}, N1={N1}, S1={S1}, D={D}, causal={causal}, dtype={dtype}  ======\n")
+    torch.manual_seed(20)
+    # 创建输入张量 BNSD
+    q = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    k = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    v = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+
+    sm_scale = 0.5
+    try:
+        # triton kernel
+        tri_out = attention(q, k, v, causal, sm_scale, BM, BN).half()
+
+        # M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))
+        # p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+
+        # if causal:
+        #     p[:, :, M==0] = float('-inf')
+        # p = torch.softmax(p.float(), dim=-1).half().to(v.dtype)
+
+        # ref_out = torch.matmul(p, v)
+
+        ref_out = torch_npu.npu_fusion_attention(
+            q, k, v, N1,
+            padding_mask=None,
+            atten_mask=None,
+            scale=sm_scale,
+            keep_prob=1.0,
+            input_layout="BNSD",
+            pre_tockens=65535,
+            next_tockens=65535,
+            sparse_mode=0,
+            )[0]
+
+        atol, rtol = precision_atol_rtol(dtype)         # 误差分析
+        errors = compute_errors(ref_out, tri_out)
+        passed = torch.allclose(ref_out, tri_out, atol=atol, rtol=rtol, equal_nan=True)
+
+        # def profiling_forward_fn():
+        #     attention(q, k, v, causal, sm_scale, BM, BN)
+
+        # # 性能测试
+        # kernel_avg_time = do_bench(profiling_forward_fn, keep_res=False, rep=10)
+
+        test_results.append({
+            "From": From,
+            "Testcase Name": test_name,
+            "B": B,
+            "N1": N1,
+            "S1": S1,
+            "D": D,
+            "Dtype": dtype,
+            "sparse mode": str(sparse_mode),
+            "Layout": "BNSD",
+            "BM": BM,
+            "BN": BN,
+            "causal": str(causal),
+            "result": "Success",
+            "Precision result": "Pass" if passed else "Fail",
+            **{f"Actual out {k}": str(v) for k, v in errors.items()},
+            # "Actual kernel time forward": kernel_avg_time,
+        })
+    except Exception as e:
+        # 捕获异常并记录测试结果
+        test_results.append({
+            "From": From,
+            "Testcase Name": test_name,
+            "B": B,
+            "N1": N1,
+            "S1": S1,
+            "D": D,
+            "Dtype": dtype,
+            "sparse mode": str(sparse_mode),
+            "Layout": "BNSD",
+            "BM": BM,
+            "BN": BN,
+            "causal": str(causal),
+            "result": "Error",
+            "Precision result": "Error",
+            "Error Message": str(e),
+        })
+        print(f"Test case [{From}-{test_name}] failed with exception: {e}")
+        pytest.fail(f"Test failed with exception [{From}-{test_name}]: {e}")
+    finally:
+        # 显式删除张量，释放计算图
+        del q, k, v
+
+
+def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype, BM, BN):
+    torch.manual_seed(20)
+    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
+    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
+    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
+
+    sm_scale = 0.5
+
+    shape_str = 'x'.join(map(str, [Z, H, N_CTX, HEAD_DIM]))
+    stream = torch.npu.current_stream()
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        l2_cache=False,
+        data_simplification=False
+    )
+    torch_path = "./FA_FWD_PROF/"+shape_str+"/"+str(causal)+"/torch/"
+    LOOP = 20
+    with torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.NPU
+        ],
+        schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=LOOP, repeat=1, skip_first=1),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+        record_shapes=True,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+    ) as prof:
+        stream.synchronize()
+        prof.step()
+        for i in range(LOOP + 2):
+            ref_out = torch_npu.npu_fusion_attention(
+                q, k, v, H,
+                padding_mask=None,
+                atten_mask=None,
+                scale=sm_scale,
+                keep_prob=1.0,
+                input_layout="BNSD",
+                pre_tockens=65535,
+                next_tockens=65535,
+                sparse_mode=0,
+                )[0]
+            prof.step()
+            if i == 0:
+                stream.synchronize()
+        stream.synchronize()
+    
+    tilling_str = 'x'.join(map(str, [BM, BN]))
+    torch_path = f"./FA_FWD_PROF/{shape_str}/{str(causal)}/torch/{tilling_str}/"
+    with torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.NPU
+        ],
+        schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=LOOP, repeat=1, skip_first=1),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+        record_shapes=True,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+    ) as prof:
+        stream.synchronize()
+        prof.step()
+        for i in range(LOOP + 2):
+            tri_out = attention(q, k, v, causal, sm_scale, BM, BN).half()
+            prof.step()
+            if i == 0:
+                stream.synchronize()
+        stream.synchronize()
+    rtol = 0.0
+    atol = 1e-2
+    assert torch.allclose(ref_out, tri_out, atol=atol, rtol=rtol, equal_nan=True)
+
+
+
+def collect_single(base_dir: str, key: str = None) -> float:
+    if not os.path.exists(base_dir):
+        return float('inf')
+
+    import pandas as pd
+    for root, _, files in os.walk(base_dir):
+        for file in files:
+            if file != 'op_statistic.csv':
+                continue
+            target_file = os.path.join(root, file)
+            df = pd.read_csv(target_file)
+            if key is not None:
+                key_rows = df[df['OP Type'].str.startswith(key, na=False)]
+                if not key_rows.empty:
+                    return key_rows['Avg Time(us)'].values[0]
+                return float('inf')
+            else:
+                # default: read the first row except header
+                return df.loc[0, 'Avg Time(us)']
+
+    return float('inf')
+
+def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean", keep_res=False):
+    """
+    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
+    the 20-th and 80-th performance percentile.
+
+    :param fn: Function to benchmark
+    :type fn: Callable
+    :param warmup: Warmup time (in ms)
+    :type warmup: int
+    :param rep: Repetition time (in ms)
+    :type rep: int
+    :param grad_to_none: Reset the gradient of the provided tensor to None
+    :type grad_to_none: torch.tensor, optional
+    :param quantiles: Performance percentile to return in addition to the median.
+    :type quantiles: list[float], optional
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".    :type return_mode: str
+    """
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+    import torch
+
+    enable_bench_npu = os.getenv("TRITON_BENCH_METHOD", 'default').lower() in ('npu')
+    enable_bench_gpu = os.getenv("TRITON_BENCH_METHOD", 'default').lower() in ('gpu')
+    if enable_bench_npu:
+        avg_times = do_bench_npu(fn, warmup=max(5, warmup), active=max(10, rep), keep_res=keep_res)
+        print(f"Average time on NPU: {avg_times:.2f} us")
+        return _summarize_statistics(torch.tensor([avg_times], dtype=torch.float), quantiles, return_mode)
+    elif enable_bench_gpu:
+        avg_times = do_bench_gpu(fn, warmup=max(5, warmup), active=max(10, rep))
+        return _summarize_statistics(torch.tensor([avg_times], dtype=torch.float), quantiles, return_mode)
+
+
+def _summarize_statistics(times, quantiles, return_mode):
+    import torch
+    if quantiles is not None:
+        ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()
+        if len(ret) == 1:
+            ret = ret[0]
+        return ret
+    if return_mode == "all":
+        return times.tolist()
+    return getattr(torch, return_mode)(times).item()
+
+
+def do_bench_npu(fn, warmup=5, active=30, prof_dir=None, keep_res=False):
+    import torch
+    import torch_npu
+    from datetime import datetime, timezone
+
+    # warmup kernel
+    fn()
+    torch.npu.synchronize()
+
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        l2_cache=False,
+        data_simplification=False
+    )
+    skip_first = 1
+    wait = 0
+    repeat = 1
+    total = skip_first + (wait + warmup + active) * repeat
+
+    if prof_dir is not None:
+        torch_path = prof_dir
+    else:
+        process = multiprocessing.current_process()
+        pid = process.pid
+        process_name = process.name
+        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+        torch_path = os.path.join("profile_results", f"prof_{timestamp}_{process_name}-{pid}")
+    with torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU
+        ],
+        schedule=torch_npu.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat, skip_first=skip_first),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+    ) as prof:
+        for _ in range(total):
+            fn()
+            prof.step()
+            torch.npu.synchronize()
+    time = collect_single(torch_path)
+    del prof
+    torch.npu.empty_cache()
+
+    if not keep_res:
+        import shutil
+        if os.path.exists(torch_path):
+            shutil.rmtree(torch_path)
+
+    return time
+
+
+def do_bench_gpu(fn, warmup=5, active=30):
+    from datetime import datetime, timezone
+
+    # warmup kernel
+    fn()
+    torch.cuda.synchronize()
+
+    skip_first = 10
+    wait = 0
+    repeat = 1
+    total = skip_first + (wait + warmup + active) * repeat
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat, skip_first=skip_first),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+    ) as prof:
+        torch.cuda.synchronize()
+        for i in range(total):
+            fn()
+            prof.step()
+        torch.cuda.synchronize()
+
+    times = parse_prof(prof)
+    del prof
+    torch.cuda.empty_cache()
+
+    return times
+
+
+def parse_prof(prof):
+    event_list = prof.events()
+    parsed_times = []
+
+    for evt in event_list:
+        if evt.device_type == torch.profiler.DeviceType.CUDA:
+            parsed_times.append(evt.device_time_total)
+    
+    return parsed_times
+
+
+if __name__ == "__main__":
+    test_op(4, 32, 2048, 64, False, torch.float16, 128, 256)
