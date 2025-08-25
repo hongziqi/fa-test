@@ -171,8 +171,9 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 
         # p = tl.math.exp2(qk)
         p = tl.math.exp(qk)
-        p_cast = p.to(tl.float16)
+        # p_cast = p.to(tl.float16)
         v = tl.load(V_block_ptr)
+        p_cast = p.to(v.dtype)  # fix to bf16: tl.dot(p_cast, v) -> Got fp16 and bf16
 
         pv = tl.dot(p_cast, v)
         l_ij = tl.sum(p, 1)
@@ -641,8 +642,8 @@ def pytest_generate_tests(metafunc):
             "Layout": "Layout",
         }
         new_field = {
-            # "BM": 64,
-            # "BN": 64,
+            "BM": 64,
+            "BN": 64,
             "causal": False,
         }
         filter_data = {
