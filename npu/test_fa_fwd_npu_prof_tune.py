@@ -89,6 +89,7 @@ import pandas as pd
 import subprocess
 import multiprocessing
 from typing import Dict, Tuple, Optional, Any, Union, List
+from triton.testing import do_bench
 
 
 torch.npu.set_device(0)
@@ -100,7 +101,7 @@ RESULT_DIR = "./test_results_batch"
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 import os
-os.environ["TRITON_BENCH_METHOD"] = "npu" # 设置为 NPU 测试方法
+# os.environ["TRITON_BENCH_METHOD"] = "npu" # 设置为 NPU 测试方法
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1" # 打印自动调优信息
 
 test_results = []  # 全局结果存储
@@ -423,7 +424,7 @@ class _attention(torch.autograd.Function):
             NUM_BLOCKS_PER_CORE=NUM_BLOCKS_PER_CORE,
             NUM_BLOCKS=NUM_BLOCKS,
             NUM_BLOCKS_M=NUM_BLOCKS_M,
-            debug=True,
+            # debug=True,
             # multibuffer=True, # autotune config, 控制开double buffer
             # unit_flag=True, # autotune config, cube搬出的一个优化项
             # nested_sub_block_num=4, # autotune config, vector 切分的一个参数，最好是2的幂次，【2,4,8,16】-》BM，硬件单元是2个vector核一组，bm/2 -> for #e.g. bm=128, per core 64, 实际行为 for 4，每次 16
@@ -432,11 +433,11 @@ class _attention(torch.autograd.Function):
             **extra_kern_args)
 
 
-        ctx.save_for_backward(q, k, v, o, M)
-        # ctx.grid = grid
-        ctx.sm_scale = sm_scale
-        ctx.HEAD_DIM = HEAD_DIM_K
-        ctx.causal = causal
+        # ctx.save_for_backward(q, k, v, o, M)
+        # # ctx.grid = grid
+        # ctx.sm_scale = sm_scale
+        # ctx.HEAD_DIM = HEAD_DIM_K
+        # ctx.causal = causal
         return o
 
 
@@ -649,57 +650,57 @@ def pytest_generate_tests(metafunc):
         filter_data = {
             "Layout": "BNSD",  # 只测试 BNSD 布局(4096)
         }
-        # 提取测试数据
-        test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=False, sampling_rows=128,
-                                           insert_row={"D": D_FANHUA_LIST})
-        test_data = extract_test_case_data(paths, extract_map, new_field, filter_data)
+        # # 提取测试数据
+        # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=False, sampling_rows=128,
+        #                                    insert_row={"D": D_FANHUA_LIST})
+        # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data)
 
-        test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
-        # （全量）确保只对 test_case 参数化一次
-        # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
+        # test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
+        # # （全量）确保只对 test_case 参数化一次
+        # # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
 
-        # （分批）对 test_case 参数化
-        # 选择当前批次的测试案例
-        start_index = metafunc.config.getoption("start_index")
-        batch_size = metafunc.config.getoption("batch_size")
-        end_index = min(start_index + batch_size, len(test_cases))
-        batch_cases = test_cases[start_index:end_index]
-        print(f">>> Running test batch: {start_index} to {end_index-1} ({len(batch_cases)} cases)")
-        metafunc.parametrize("test_case", batch_cases, 
-                            ids=[f"{case['From']}_{case['Testcase Name']}" for case in batch_cases])
+        # # （分批）对 test_case 参数化
+        # # 选择当前批次的测试案例
+        # start_index = metafunc.config.getoption("start_index")
+        # batch_size = metafunc.config.getoption("batch_size")
+        # end_index = min(start_index + batch_size, len(test_cases))
+        # batch_cases = test_cases[start_index:end_index]
+        # print(f">>> Running test batch: {start_index} to {end_index-1} ({len(batch_cases)} cases)")
+        # metafunc.parametrize("test_case", batch_cases, 
+        #                     ids=[f"{case['From']}_{case['Testcase Name']}" for case in batch_cases])
 
 
-        # # 非测试文件的测试案例
-        # test_cases = [
-        #     # [1, 3, 53255, 128, False, torch.bfloat16, 64, 64, "step64+7", "FlashAttentionScore_BNSD_0833", 0],
-        #     # [1, 24, 15296, 64, False, torch.bfloat16, 64, 64, "step64_01", "FlashAttentionScore_BNSD_0239", 0],
-        #     # [1, 3, 75328, 64, False, torch.bfloat16, 64, 64, "step64_02", "FlashAttentionScore_BNSD_1177", 0],
-        #     # [1, 3, 64000, 64000, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
-        #     # [1, 24, 9792, 72, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
-        #     # [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
-        #     # [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
-        #     # [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
-        #     # [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
-        #     # [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
-        #     # [2, 8, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "LLaMa_RealCase_0007", 0],
-        #     # [1, 12, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0001", 0],
-        #     # [1, 12, 4096, 128, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0002", 0],
-        #     # [1, 4, 4096, 256, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0003", 0],
-        #     # [1, 8, 8192, 128, False, torch.bfloat16, 64, 64, "模型规格", "TongYiQianWen_RealCase_0001", 0],
-        #     # [1, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_173", 0],
-        #     # [1, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_174", 0],
-        #     # [2, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_175", 0],
-        #     # [2, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_176", 0],
-        #     [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
-        #     # [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
-        #     # [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
-        #     # [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
-        #     # [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
-        #     # [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
-        #     # [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0], # NPU out of memory. Tried to allocate 64.00 GiB
-        #     # [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0], # NPU out of memory. Tried to allocate 64.00 GiB
-        # ]
-        # metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
+        # 非测试文件的测试案例
+        test_cases = [
+            # [1, 3, 53255, 128, False, torch.bfloat16, 64, 64, "step64+7", "FlashAttentionScore_BNSD_0833", 0],
+            # [1, 24, 15296, 64, False, torch.bfloat16, 64, 64, "step64_01", "FlashAttentionScore_BNSD_0239", 0],
+            # [1, 3, 75328, 64, False, torch.bfloat16, 64, 64, "step64_02", "FlashAttentionScore_BNSD_1177", 0],
+            # [1, 3, 64000, 64000, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
+            # [1, 24, 9792, 72, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
+            [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
+            [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
+            # [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
+            # [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
+            # [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
+            # [2, 8, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "LLaMa_RealCase_0007", 0],
+            # [1, 12, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0001", 0],
+            # [1, 12, 4096, 128, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0002", 0],
+            # [1, 4, 4096, 256, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0003", 0],
+            # [1, 8, 8192, 128, False, torch.bfloat16, 64, 64, "模型规格", "TongYiQianWen_RealCase_0001", 0],
+            # [1, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_173", 0],
+            # [1, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_174", 0],
+            # [2, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_175", 0],
+            # [2, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_176", 0],
+            # [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
+            # [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
+            # [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
+            # [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
+            # [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
+            # [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
+            # [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0], # NPU out of memory. Tried to allocate 64.00 GiB
+            # [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0], # NPU out of memory. Tried to allocate 64.00 GiB
+        ]
+        metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
 
 
 def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
@@ -710,9 +711,9 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
     print(f"\n======  Running: {From}-{test_name} || B={B}, N1={N1}, S1={S1}, D={D}, causal={causal}, dtype={dtype}  ======\n")
     torch.manual_seed(20)
     # 创建输入张量 BNSD
-    q = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
+    q = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
+    k = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
+    v = (torch.empty((B, N1, S1, D), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
 
     sm_scale = 0.5
     try:
@@ -745,10 +746,11 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
         # passed = torch.allclose(ref_out, tri_out, atol=atol, rtol=rtol)
 
         def profiling_forward_fn():
-            attention(q, k, v, causal, sm_scale, BM, BN).half()
+            attention(q, k, v, causal, sm_scale, BM, BN)
 
         # 性能测试
-        kernel_avg_time = do_bench(profiling_forward_fn, keep_res=False, rep=10)
+        # kernel_avg_time = do_bench(profiling_forward_fn, keep_res=False, rep=10)
+        kernel_avg_time = do_bench(profiling_forward_fn, rep=10)
         print(f">> Kernel average time: {kernel_avg_time}")
 
         test_results.append({
@@ -821,34 +823,34 @@ def collect_single(base_dir: str, key: str = None) -> float:
 
     return float('inf')
 
-def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean", keep_res=False):
-    """
-    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
-    the 20-th and 80-th performance percentile.
+# def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean", keep_res=False):
+#     """
+#     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
+#     the 20-th and 80-th performance percentile.
 
-    :param fn: Function to benchmark
-    :type fn: Callable
-    :param warmup: Warmup time (in ms)
-    :type warmup: int
-    :param rep: Repetition time (in ms)
-    :type rep: int
-    :param grad_to_none: Reset the gradient of the provided tensor to None
-    :type grad_to_none: torch.tensor, optional
-    :param quantiles: Performance percentile to return in addition to the median.
-    :type quantiles: list[float], optional
-    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".    :type return_mode: str
-    """
-    assert return_mode in ["min", "max", "mean", "median", "all"]
-    import torch
+#     :param fn: Function to benchmark
+#     :type fn: Callable
+#     :param warmup: Warmup time (in ms)
+#     :type warmup: int
+#     :param rep: Repetition time (in ms)
+#     :type rep: int
+#     :param grad_to_none: Reset the gradient of the provided tensor to None
+#     :type grad_to_none: torch.tensor, optional
+#     :param quantiles: Performance percentile to return in addition to the median.
+#     :type quantiles: list[float], optional
+#     :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".    :type return_mode: str
+#     """
+#     assert return_mode in ["min", "max", "mean", "median", "all"]
+#     import torch
 
-    enable_bench_npu = os.getenv("TRITON_BENCH_METHOD", 'default').lower() in ('npu')
-    enable_bench_gpu = os.getenv("TRITON_BENCH_METHOD", 'default').lower() in ('gpu')
-    if enable_bench_npu:
-        avg_times = do_bench_npu(fn, warmup=max(5, warmup), active=max(10, rep), keep_res=keep_res)
-        return _summarize_statistics(torch.tensor([avg_times], dtype=torch.float), quantiles, return_mode)
-    elif enable_bench_gpu:
-        avg_times = do_bench_gpu(fn, warmup=max(5, warmup), active=max(10, rep))
-        return _summarize_statistics(torch.tensor([avg_times], dtype=torch.float), quantiles, return_mode)
+#     enable_bench_npu = os.getenv("TRITON_BENCH_METHOD", 'default').lower() in ('npu')
+#     enable_bench_gpu = os.getenv("TRITON_BENCH_METHOD", 'default').lower() in ('gpu')
+#     if enable_bench_npu:
+#         avg_times = do_bench_npu(fn, warmup=max(5, warmup), active=max(10, rep), keep_res=keep_res)
+#         return _summarize_statistics(torch.tensor([avg_times], dtype=torch.float), quantiles, return_mode)
+#     elif enable_bench_gpu:
+#         avg_times = do_bench_gpu(fn, warmup=max(5, warmup), active=max(10, rep))
+#         return _summarize_statistics(torch.tensor([avg_times], dtype=torch.float), quantiles, return_mode)
 
 
 def _summarize_statistics(times, quantiles, return_mode):
