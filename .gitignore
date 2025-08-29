@@ -2,6 +2,7 @@
 __pycache__/
 test_data/
 test_results/
+test_results_batch/
 fusion_result.json
 
 kernel_meta/

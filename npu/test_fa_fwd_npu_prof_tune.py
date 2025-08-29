@@ -90,6 +90,7 @@ import subprocess
 import multiprocessing
 from typing import Dict, Tuple, Optional, Any, Union, List
 from triton.testing import do_bench
+import itertools
 
 
 torch.npu.set_device(0)
@@ -101,7 +102,7 @@ RESULT_DIR = "./test_results_batch"
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 import os
-# os.environ["TRITON_BENCH_METHOD"] = "npu" # 设置为 NPU 测试方法
+os.environ["TRITON_BENCH_METHOD"] = "npu" # 设置为 NPU 测试方法
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1" # 打印自动调优信息
 
 test_results = []  # 全局结果存储
@@ -194,11 +195,12 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 
 def get_autotune_config_old():
     return [
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_stages=1, num_warps=1),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_stages=1, num_warps=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256}),
+        # triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_stages=1, num_warps=1),
+        # triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_stages=1, num_warps=1),
 
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=1, num_warps=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_stages=1, num_warps=1),
+        # triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+        # triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_stages=1, num_warps=1),
 
         # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=1, num_warps=1),
 
@@ -210,67 +212,89 @@ def get_autotune_config_old():
 
 def get_autotune_config():
     configs = []
-    block_pairs = [
-        (16, 128), (16, 256), (32, 64), (32, 128),
-        (64, 64), (128, 16), (128, 32), (128, 64),
-        (64, 128), (64,256), (128,128),(128, 256),
-        (256, 128), (256,256)
-    ]
-    multibuffer_list = [True]
-    unit_flag_list = [True]
-    # nested_sub_block_num_list = [2, 4, 8, 16]
-    nested_sub_block_num_list = [2, 4]
-    limit_auto_multi_buffer_only_for_local_buffer_list = [True, False]
-    set_workspace_multibuffer_list = [2, 4]
+    BM_list = [64]  # [64, 128, 256]
+    BN_list = [64]  # [64, 128, 256, 512]
 
-    for BLOCK_M, BLOCK_N in block_pairs:
-        for multibuffer in multibuffer_list:
-            for unit_flag in unit_flag_list:
-                for nested_sub_block_num in nested_sub_block_num_list:
-                    for limit_auto_multi_buffer_only_for_local_buffer in limit_auto_multi_buffer_only_for_local_buffer_list:
-                        if not limit_auto_multi_buffer_only_for_local_buffer:
-                            for set_workspace_multibuffer in set_workspace_multibuffer_list:
-                                configs.append(
-                                    triton.Config(
-                                        {
-                                            "BLOCK_M": BLOCK_M,
-                                            "BLOCK_N": BLOCK_N,
-                                            "multibuffer": multibuffer,
-                                            "unit_flag": unit_flag,
-                                            "nested_sub_block_num": nested_sub_block_num,
-                                            "limit_auto_multi_buffer_only_for_local_buffer": limit_auto_multi_buffer_only_for_local_buffer,
-                                            "set_workspace_multibuffer": set_workspace_multibuffer,
-                                        }
-                                    )
-                                )
-                        else:
-                            configs.append(
-                                triton.Config(
-                                    {
-                                        "BLOCK_M": BLOCK_M,
-                                        "BLOCK_N": BLOCK_N,
-                                        "multibuffer": multibuffer,
-                                        "unit_flag": unit_flag,
-                                        "nested_sub_block_num": nested_sub_block_num,
-                                        "limit_auto_multi_buffer_only_for_local_buffer": limit_auto_multi_buffer_only_for_local_buffer,
-                                    }
-                                )
-                            )
+    # BM_list = [64, 128, 256]
+    # BN_list = [64, 128, 256, 512]
+
+    multibuffer_list = [True]  # [True, False]
+    unit_flag_list = [True]  # [True, False]
+    limit_auto_multi_buffer_only_for_local_buffer_list = [False]  # [True, False]
+    limit_auto_multi_buffer_of_local_buffer_list = ["no-l0c"]  # ["no-limit", "no-l0c"]
+
+    # These knobs are tuned only when limit_auto_multi_buffer_only_for_local_buffer=False
+    set_workspace_multibuffer_list = [2]  # [2, 4]
+    nested_sub_block_num_list = [2]  # [2, 4, 8]
+    # set_workspace_multibuffer_list = [2, 4]  # [2, 4]
+    # nested_sub_block_num_list = [2, 4]  # [2, 4, 8]
+    enable_hivm_auto_cv_balance_list = [True]  # [True, False]
+    # nested_vector_loop_num_list = [2]  # [2, 4]
+    # nested_cube_loop_num_list = [2]  # [2, 4]
+
+    for (
+        BM,
+        BN,
+        multibuffer,
+        unit_flag,
+        limit_auto_multi_buffer_only_for_local_buffer,
+        limit_auto_multi_buffer_of_local_buffer,
+    ) in itertools.product(
+        BM_list,
+        BN_list,
+        multibuffer_list,
+        unit_flag_list,
+        limit_auto_multi_buffer_only_for_local_buffer_list,
+        limit_auto_multi_buffer_of_local_buffer_list,
+    ):
+
+        if limit_auto_multi_buffer_only_for_local_buffer:
+            # Keep defaults when tuning doesn't make sense
+            configs.append(
+                triton.Config(
+                    {"BLOCK_M": BM, "BLOCK_N": BN},
+                    multibuffer=multibuffer,
+                    unit_flag=unit_flag,
+                    limit_auto_multi_buffer_only_for_local_buffer=limit_auto_multi_buffer_only_for_local_buffer,
+                    limit_auto_multi_buffer_of_local_buffer=limit_auto_multi_buffer_of_local_buffer,
+                )
+            )
+        else:
+            # Fully expand tuning space
+            for (
+                set_workspace_multibuffer,
+                nested_sub_block_num,
+                enable_hivm_auto_cv_balance,
+                # nested_vector_loop_num,
+                # nested_cube_loop_num,
+            ) in itertools.product(
+                set_workspace_multibuffer_list,
+                nested_sub_block_num_list,
+                enable_hivm_auto_cv_balance_list,
+                # nested_vector_loop_num_list,
+                # nested_cube_loop_num_list,
+            ):
+                configs.append(
+                    triton.Config(
+                        {"BLOCK_M": BM, "BLOCK_N": BN},
+                        multibuffer=multibuffer,
+                        unit_flag=unit_flag,
+                        limit_auto_multi_buffer_only_for_local_buffer=limit_auto_multi_buffer_only_for_local_buffer,
+                        limit_auto_multi_buffer_of_local_buffer=limit_auto_multi_buffer_of_local_buffer,
+                        set_workspace_multibuffer=set_workspace_multibuffer,
+                        nested_sub_block_num=nested_sub_block_num,
+                        enable_hivm_auto_cv_balance=enable_hivm_auto_cv_balance,
+                        # nested_vector_loop_num=nested_vector_loop_num,
+                        # nested_cube_loop_num=nested_cube_loop_num,
+                    )
+                )
+
     return configs
-
-values = {"has_exception": False}
-
-
-def _post_hook(*args, exception):
-    if exception is not None:
-        values["has_exception"] = True
-        # print(f">> Exception occurred: {exception}")
 
 
 @triton.autotune(
     configs=get_autotune_config(),
     key=['Z', 'H', 'N_CTX', 'HEAD_DIM'],  # 加入 shape 相关的关键参数
-    post_hook=_post_hook,
 )
 @triton.jit
 def _attn_fwd(Q, K, V, M, Out, sm_scale,  #
@@ -677,8 +701,8 @@ def pytest_generate_tests(metafunc):
             # [1, 3, 75328, 64, False, torch.bfloat16, 64, 64, "step64_02", "FlashAttentionScore_BNSD_1177", 0],
             # [1, 3, 64000, 64000, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
             # [1, 24, 9792, 72, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
-            [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
-            [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
+            # [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0], # ok
+            # [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
             # [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
             # [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
             # [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
@@ -695,7 +719,7 @@ def pytest_generate_tests(metafunc):
             # [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
             # [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
             # [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
-            # [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
+            [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
             # [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
             # [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0], # NPU out of memory. Tried to allocate 64.00 GiB
             # [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0], # NPU out of memory. Tried to allocate 64.00 GiB
@@ -750,8 +774,14 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
 
         # 性能测试
         # kernel_avg_time = do_bench(profiling_forward_fn, keep_res=False, rep=10)
-        kernel_avg_time = do_bench(profiling_forward_fn, rep=10)
-        print(f">> Kernel average time: {kernel_avg_time}")
+        allocated_memory = torch.npu.memory_allocated()
+        print(">> before run: ", allocated_memory)
+        for i in range(1000):
+            attention(q, k, v, causal, sm_scale, BM, BN)
+            allocated_memory = torch.npu.memory_allocated()
+            print(f">> before after {i}: {allocated_memory}")
+        # kernel_avg_time = do_bench(profiling_forward_fn, rep=10)
+        # print(f">> Kernel average time: {kernel_avg_time}")
 
         test_results.append({
             "From": From,
@@ -769,7 +799,7 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
             "result": "Success",
             # "Precision result": "Pass" if passed else "Fail",
             # **{f"Actual out {k}": str(v) for k, v in errors.items()},
-            "Actual kernel time forward": kernel_avg_time,
+            # "Actual kernel time forward": kernel_avg_time,
         })
     except Exception as e:
         # 捕获异常并记录测试结果
