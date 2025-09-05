@@ -229,8 +229,8 @@ def get_autotune_config():
     # set_workspace_multibuffer_list = [2, 4]  # [2, 4]
     # nested_sub_block_num_list = [2, 4]  # [2, 4, 8]
     enable_hivm_auto_cv_balance_list = [True]  # [True, False]
-    nested_vector_loop_num_list = [2]  # [2, 4]
-    nested_cube_loop_num_list = [2]  # [2, 4]
+    nested_vector_loop_num_list = [2, 4]  # [2, 4]
+    nested_cube_loop_num_list = [2, 4]  # [2, 4]
 
     for (
         BM,
@@ -282,10 +282,10 @@ def get_autotune_config():
                         limit_auto_multi_buffer_only_for_local_buffer=limit_auto_multi_buffer_only_for_local_buffer,
                         limit_auto_multi_buffer_of_local_buffer=limit_auto_multi_buffer_of_local_buffer,
                         set_workspace_multibuffer=set_workspace_multibuffer,
-                        nested_sub_block_num=nested_sub_block_num,
+                        # nested_sub_block_num=nested_sub_block_num,
                         enable_hivm_auto_cv_balance=enable_hivm_auto_cv_balance,
-                        # nested_vector_loop_num=nested_vector_loop_num,
-                        # nested_cube_loop_num=nested_cube_loop_num,
+                        nested_vector_loop_num=nested_vector_loop_num,
+                        nested_cube_loop_num=nested_cube_loop_num,
                     )
                 )
 
