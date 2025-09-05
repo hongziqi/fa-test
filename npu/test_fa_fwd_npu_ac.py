@@ -1,82 +1,3 @@
-"""
-=========== FA Triton Kernel 泛化性测试 ===========
-已知 测试 表格: 
-  FlashAttentionScore_step64_case_d64_Result.xls 
-  FlashAttentionScore_step64+7_case_d64_Result.xls
-
->> 每一行代表一个测试用例，包含以下字段(共78个)及示例内容：
-Group: FlashAttentionScore
-Testcase Name: FlashAttentionScore_BNSD_{num} / FlashAttentionScore_BSH_{num}
-Enable: disable/onlypref
-Level: level0
-Network Type: fanhua
-B: 1                    #
-N1: 24
-N2: 3
-S1: 64
-S2: 64
-D: 64
-Dtype: bf16
-sparse mode: 0
-pre tockens: 65536
-next tockens: 65536
-Layout: BNSD / BSH
-PSE: None
-pse type: None
-Atten mask Dtype: None
-Atten mask Shape: None
-Padding Mask: None
-keep prob: 1
-Expect out pricision: 
-Expect out err max: 
-Expect out err sum: 
-Expect out eb: 
-Expect dp pricision: 
-Actual out pricision: 0
-Actual out err max: 0
-Actual out err sum: 0
-Actual out eb: 0
-Actual dp pricision: 0
-Actual dp err max: 0
-Actual dp err sum: 0
-Actual dp eb: 0
-Actual dk pricision: 0
-Actual dk err max: 0
-Actual dk err sum: 0
-Actual dk eb: 0
-Actual dv pricision: 0
-Actual dv err max: 0
-Actual dv err sum: 0
-Actual dv eb: 0
-Actual Memory: 0
-Actual kernel time forward: 0.0316
-Actual kernel time backward: 0.0979
-Actual e2e time forward: 0
-Actual e2e time backward: 0
-Precision result: Fail
-Rmse result: Pass
-Rme result: Pass
-EB result: 
-Performance result: Fail
-Memory result: Fail
-running status: PASS
-Actual kernel time forward transpose: 0.0694
-Actual kernel time backward transpose: 0.5471
-Actual kernel time forward pad: 0
-Actual kernel time backward pad: 0.0000
-Actual kernel time forward slice: 0
-Actual kernel time backward slice: 0.0000
-Actual kernel time forward gpu:
-Actual kernel time backward gpu:
-BNSD+transpose: 0.1010
->>
-任务描述：基于表格数据驱动 test_op_fwd, 完成泛化性测试（精度+性能）。
-精度测试：直接 NPU 侧对比 ref_out 和 tri_out 的结果。
-性能测试：与 GPU 侧对比，计算 kernel_time 和 e2e_time。
-最终目的：泛化性验证 FlashAttentionScore 的精度和性能。
-=========== FA Triton Kernel 泛化性测试 ===========
-"""
-
 import pytest
 import torch
 import torch_npu
@@ -111,15 +32,15 @@ dtype_map = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': torch.float3
 # D 泛化列表
 D_FANHUA_LIST = [64, 72, 80, 88, 96, 128, 256]
 
-# ========== Triton Kernel 实现（保持不变） ==========
+# ========== Triton Kernel 实现 0904（保持不变） ==========
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
-
+## this version support HEAD_DIM > 128 and golden baseline is ascendC
 @triton.jit
-def _attn_fwd_inner(acc, l_i, m_i, q,  #
+def _attn_fwd_inner(acc_ptr, l_i, m_i, q,  #
                     K_block_ptr, V_block_ptr,  #
-                    start_m, qk_scale,  #
+                    start_m, qk_scale: tl.constexpr,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
                     N_CTX: tl.constexpr, fp8_v: tl.constexpr):
@@ -141,11 +62,16 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     else:
         lo, hi = 0, N_CTX
     # k 之前的版本，随路做转置的版本
-    #K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    # K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     
     # 修改后不转的版本
     K_block_ptr = tl.advance(K_block_ptr, (lo, 0))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+
+    row = tl.arange(0, BLOCK_M)[:, None]
+    col_head_dim = tl.arange(0, HEAD_DIM)[None, :]
+    block2d_acc = row * HEAD_DIM + col_head_dim
+
     # loop over k, v and update accumulator
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -165,13 +91,18 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         else:
             qk = qk * qk_scale
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk -= m_ij[:, None]
+            qk = qk - m_ij[:, None]
 
         # p = tl.math.exp2(qk)
         p = tl.math.exp(qk)
-        # p_cast = p.to(tl.float16)
+
+        # [bm, head_dim] * [bn, head_dim].transpose
+        if fp8_v:
+            p_cast = p.to(tl.float8e5)
+        else:
+            # p = p.to(tl.float16)      // FIXHERE to bf16 unspported
+            p_cast = p.to(k.dtype)
         v = tl.load(V_block_ptr)
-        p_cast = p.to(v.dtype)  # fix to bf16: tl.dot(p_cast, v) -> Got fp16 and bf16
 
         pv = tl.dot(p_cast, v)
         l_ij = tl.sum(p, 1)
@@ -180,46 +111,49 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         # alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
         # -- update output accumulator --
-        acc = acc * alpha[:, None] + pv
-  
-        # update m_i and l_i
+        if HEAD_DIM <= 256:
+            acc_ptr = acc_ptr * alpha[:, None]
+            acc_ptr = tl.dot(p_cast, v, acc_ptr)
+        else:
+            acc = tl.load(acc_ptr + block2d_acc)
+            acc0 = tl.extract_slice(acc,(0, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            alpha0 = tl.extract_slice(alpha, [0], [BLOCK_M // 4], [1])
+            acc0 = acc0 * alpha0[:, None]
+            pv0 = tl.extract_slice(pv, (0, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            acc0 = pv0 + acc0
+            acc = tl.insert_slice(acc, acc0, (0, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+
+            acc1 = tl.extract_slice(acc,(BLOCK_M // 4, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            alpha1 = tl.extract_slice(alpha, [BLOCK_M // 4], [BLOCK_M // 4], [1])
+            acc1 = acc1 * alpha1[:, None]
+            pv1 = tl.extract_slice(pv, (BLOCK_M // 4, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            acc1 = pv1 + acc1
+            acc = tl.insert_slice(acc, acc1, (BLOCK_M // 4, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+
+            acc2 = tl.extract_slice(acc,(BLOCK_M // 2, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            alpha2 = tl.extract_slice(alpha, [BLOCK_M // 2], [BLOCK_M // 4], [1])
+            acc2 = acc2 * alpha2[:, None]
+            pv2 = tl.extract_slice(pv, (BLOCK_M // 2, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            acc2 = pv2 + acc2
+            acc = tl.insert_slice(acc, acc2, (BLOCK_M // 2, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+
+            acc3 = tl.extract_slice(acc,(3 * BLOCK_M // 4, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            alpha3 = tl.extract_slice(alpha, [3 * BLOCK_M // 4], [BLOCK_M // 4], [1])
+            acc3 = acc3 * alpha3[:, None]
+            pv3 = tl.extract_slice(pv, (3 * BLOCK_M // 4, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+            acc3 = pv3 + acc3
+            acc = tl.insert_slice(acc, acc3, (3 * BLOCK_M // 4, 0), (BLOCK_M // 4, HEAD_DIM), (1, 1))
+
+            tl.store(acc_ptr + block2d_acc, acc)
+
         m_i = m_ij
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (BLOCK_N, 0))
-    return acc, l_i, m_i
+    return acc_ptr, l_i, m_i
 
 
-# def get_autotune_config():
-#     return [
-#         triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_stages=1, num_warps=1),
-#         triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_stages=1, num_warps=1),
-
-#         triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=1, num_warps=1),
-#         triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_stages=1, num_warps=1),
-
-#         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=1, num_warps=1),
-
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 16}, num_stages=1, num_warps=1),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=1, num_warps=1),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=1, num_warps=1),
-#     ]
-
-# values = {"has_exception": False}
-
-
-# def _post_hook(*args, exception):
-#     if exception is not None:
-#         values["has_exception"] = True
-#         # print(f">> Exception occurred: {exception}")
-
-
-# @triton.autotune(
-#     configs=get_autotune_config(),
-#     key=['Z', 'H', 'N_CTX', 'HEAD_DIM'],  # 加入 shape 相关的关键参数
-#     post_hook=_post_hook,
-# )
 @triton.jit
-def _attn_fwd(Q, K, V, M, Out, sm_scale,  #
+def _attn_fwd(Q, K, V, M, Out, sm_scale: tl.constexpr, acc, #
               stride_qz: tl.constexpr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qk: tl.constexpr,  #
               stride_kz: tl.constexpr, stride_kh: tl.constexpr, stride_kn: tl.constexpr, stride_kk: tl.constexpr,  #
               stride_vz: tl.constexpr, stride_vh: tl.constexpr, stride_vn: tl.constexpr, stride_vk: tl.constexpr,  #
@@ -235,7 +169,6 @@ def _attn_fwd(Q, K, V, M, Out, sm_scale,  #
               NUM_BLOCKS_M: tl.constexpr,
               ):
     # ???, why
-    # tl.static_assert(BLOCK_N <= HEAD_DIM)
     pid = tl.program_id(0)
     block_start = pid * NUM_BLOCKS_PER_CORE
     NUM_BLOCKS_hz = NUM_BLOCKS // NUM_BLOCKS_M
@@ -293,7 +226,15 @@ def _attn_fwd(Q, K, V, M, Out, sm_scale,  #
 
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        if HEAD_DIM <= 256:
+            acc_ptr = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        else:
+            acc_offset = (
+                off_z.to(tl.int64) * stride_qz // stride_qm * HEAD_DIM +
+                off_h.to(tl.int64) * stride_qh // stride_qm * HEAD_DIM +
+                task_m_idx * BLOCK_M * HEAD_DIM
+            )
+            acc_ptr = acc + acc_offset
         # load scales
 
         # load q: it will stay in SRAM throughout
@@ -303,29 +244,37 @@ def _attn_fwd(Q, K, V, M, Out, sm_scale,  #
         # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
 
         if STAGE & 1:
-            acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
-                                            task_m_idx, sm_scale,  #
-                                            BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                            4 - STAGE, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
-                                            )
+            acc_ptr, l_i, m_i = _attn_fwd_inner(acc_ptr, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
+                                                task_m_idx, sm_scale,  #
+                                                BLOCK_M, HEAD_DIM, BLOCK_N,  #
+                                                4 - STAGE, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
+                                                )
         # stage 2: on-band
 
         if STAGE & 2:
             # barrier makes it easier for compielr to schedule the
             # two loops independently
-            acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
-                                            task_m_idx, sm_scale,  #
-                                            BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                            2, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
-                                            )
+            acc_ptr, l_i, m_i = _attn_fwd_inner(acc_ptr, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
+                                                task_m_idx, sm_scale,  #
+                                                BLOCK_M, HEAD_DIM, BLOCK_N,  #
+                                                2, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
+                                                )
         # epilogue
         # m_i += tl.math.log2(l_i)
         m_i += tl.math.log(l_i)
-        acc = acc / l_i[:, None]
+        if HEAD_DIM <= 256:
+            accumulator = acc_ptr / l_i[:, None]
+        else:
+            row = tl.arange(0, BLOCK_M)[:, None]
+            col_head_dim = tl.arange(0, HEAD_DIM)[None, :]
+            block2d_acc = row * HEAD_DIM + col_head_dim
+            accumulator = tl.load(acc_ptr + block2d_acc)
+            accumulator = accumulator / l_i[:, None]
+
         m_ptrs = M + task_hz_idx * N_CTX + offs_m
 
         tl.store(m_ptrs, m_i)
-        tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+        tl.store(O_block_ptr, accumulator.to(Out.type.element_ty))
 
 
 class _attention(torch.autograd.Function):
@@ -337,7 +286,7 @@ class _attention(torch.autograd.Function):
         # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        # assert HEAD_DIM_K in {16, 32, 64, 128, 256}  // 注释用于泛化测试 HEAD_DIM_K
+        assert HEAD_DIM_K in {64, 80, 96, 128, 256}  # 注释用于泛化测试 HEAD_DIM_K
 
         o = torch.empty_like(q)
 
@@ -353,11 +302,12 @@ class _attention(torch.autograd.Function):
         NUM_BLOCKS = NUM_BLOCKS_M * q.shape[0] * q.shape[1]
         NUM_BLOCKS_PER_CORE = triton.cdiv(NUM_BLOCKS, num_cores)
         # grid = lambda args: (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+        acc = torch.zeros((q.shape[0], q.shape[1], q.shape[2], HEAD_DIM_K), dtype=torch.float32, device=q.device)
         # grid = (triton.cdiv(q.shape[2], BM),1, 1)
         # (1, 2, 1024)
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         _attn_fwd[(num_cores,)](
-            q, k, v, M, o, sm_scale, #
+            q, k, v, M, o, sm_scale, acc, #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
@@ -370,12 +320,6 @@ class _attention(torch.autograd.Function):
             NUM_BLOCKS_PER_CORE=NUM_BLOCKS_PER_CORE,
             NUM_BLOCKS=NUM_BLOCKS,
             NUM_BLOCKS_M=NUM_BLOCKS_M,
-            debug=True,
-            multibuffer=True, # autotune config, 控制开double buffer
-            unit_flag=True, # autotune config, cube搬出的一个优化项
-            nested_sub_block_num=4, # autotune config, vector 切分的一个参数，最好是2的幂次，【2,4,8,16】-》BM，硬件单元是2个vector核一组，bm/2 -> for #e.g. bm=128, per core 64, 实际行为 for 4，每次 16
-            limit_auto_multi_buffer_only_for_local_buffer=False, # autotune config, 是否开启cube和vector的并行，false表示开启
-            set_workspace_multibuffer=4, # autotune config, 表示同时cube和vector有几个并行，【2,4】，仅limit_auto_multi_buffer_only_for_local_buffer=False 时生效
             **extra_kern_args)
 
 
@@ -656,15 +600,6 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
         # triton kernel
         tri_out = attention(q, k, v, causal, sm_scale, BM, BN)
 
-        # M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))
-        # p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
-
-        # if causal:
-        #     p[:, :, M==0] = float('-inf')
-        # p = torch.softmax(p.float(), dim=-1).half().to(v.dtype)
-
-        # ref_out = torch.matmul(p, v)
-
         ref_out = torch_npu.npu_fusion_attention(
             q, k, v, N1,
             padding_mask=None,
@@ -680,12 +615,6 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
         atol, rtol = precision_atol_rtol(dtype)         # 误差分析
         errors = compute_errors(ref_out, tri_out)
         passed = torch.allclose(ref_out, tri_out, atol=atol, rtol=rtol, equal_nan=True)
-
-        # def profiling_forward_fn():
-        #     attention(q, k, v, causal, sm_scale, BM, BN)
-
-        # # 性能测试
-        # kernel_avg_time = do_bench(profiling_forward_fn, keep_res=False, rep=10)
 
         test_results.append({
             "From": From,
@@ -703,7 +632,6 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
             "result": "Success",
             "Precision result": "Pass" if passed else "Fail",
             **{f"Actual out {k}": str(v) for k, v in errors.items()},
-            # "Actual kernel time forward": kernel_avg_time,
         })
     except Exception as e:
         # 捕获异常并记录测试结果
@@ -729,253 +657,3 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
     finally:
         # 显式删除张量，释放计算图
         del q, k, v
-
-
-def run_test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype, BM, BN):
-    torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5))
-
-    sm_scale = 0.5
-
-    shape_str = 'x'.join(map(str, [Z, H, N_CTX, HEAD_DIM]))
-    stream = torch.npu.current_stream()
-    experimental_config = torch_npu.profiler._ExperimentalConfig(
-        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-        l2_cache=False,
-        data_simplification=False
-    )
-    torch_path = "./FA_FWD_PROF/"+shape_str+"/"+str(causal)+"/torch/"
-    LOOP = 20
-    with torch_npu.profiler.profile(
-        activities=[
-            torch_npu.profiler.ProfilerActivity.NPU
-        ],
-        schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=LOOP, repeat=1, skip_first=1),
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
-        record_shapes=True,
-        profile_memory=False,
-        with_stack=False,
-        with_flops=False,
-        with_modules=False,
-        experimental_config=experimental_config,
-    ) as prof:
-        stream.synchronize()
-        prof.step()
-        for i in range(LOOP + 2):
-            ref_out = torch_npu.npu_fusion_attention(
-                q, k, v, H,
-                padding_mask=None,
-                atten_mask=None,
-                scale=sm_scale,
-                keep_prob=1.0,
-                input_layout="BNSD",
-                pre_tockens=65535,
-                next_tockens=65535,
-                sparse_mode=0,
-                )[0]
-            prof.step()
-            if i == 0:
-                stream.synchronize()
-        stream.synchronize()
-    
-    tilling_str = 'x'.join(map(str, [BM, BN]))
-    torch_path = f"./FA_FWD_PROF/{shape_str}/{str(causal)}/torch/{tilling_str}/"
-    with torch_npu.profiler.profile(
-        activities=[
-            torch_npu.profiler.ProfilerActivity.NPU
-        ],
-        schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=LOOP, repeat=1, skip_first=1),
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
-        record_shapes=True,
-        profile_memory=False,
-        with_stack=False,
-        with_flops=False,
-        with_modules=False,
-        experimental_config=experimental_config,
-    ) as prof:
-        stream.synchronize()
-        prof.step()
-        for i in range(LOOP + 2):
-            tri_out = attention(q, k, v, causal, sm_scale, BM, BN)
-            prof.step()
-            if i == 0:
-                stream.synchronize()
-        stream.synchronize()
-    rtol = 0.0
-    atol = 1e-2
-    assert torch.allclose(ref_out, tri_out, atol=atol, rtol=rtol, equal_nan=True)
-
-
-
-def collect_single(base_dir: str, key: str = None) -> float:
-    if not os.path.exists(base_dir):
-        return float('inf')
-
-    import pandas as pd
-    for root, _, files in os.walk(base_dir):
-        for file in files:
-            if file != 'op_statistic.csv':
-                continue
-            target_file = os.path.join(root, file)
-            df = pd.read_csv(target_file)
-            if key is not None:
-                key_rows = df[df['OP Type'].str.startswith(key, na=False)]
-                if not key_rows.empty:
-                    return key_rows['Avg Time(us)'].values[0]
-                return float('inf')
-            else:
-                # default: read the first row except header
-                return df.loc[0, 'Avg Time(us)']
-
-    return float('inf')
-
-def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean", keep_res=False):
-    """
-    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
-    the 20-th and 80-th performance percentile.
-
-    :param fn: Function to benchmark
-    :type fn: Callable
-    :param warmup: Warmup time (in ms)
-    :type warmup: int
-    :param rep: Repetition time (in ms)
-    :type rep: int
-    :param grad_to_none: Reset the gradient of the provided tensor to None
-    :type grad_to_none: torch.tensor, optional
-    :param quantiles: Performance percentile to return in addition to the median.
-    :type quantiles: list[float], optional
-    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".    :type return_mode: str
-    """
-    assert return_mode in ["min", "max", "mean", "median", "all"]
-    import torch
-
-    enable_bench_npu = os.getenv("TRITON_BENCH_METHOD", 'default').lower() in ('npu')
-    enable_bench_gpu = os.getenv("TRITON_BENCH_METHOD", 'default').lower() in ('gpu')
-    if enable_bench_npu:
-        avg_times = do_bench_npu(fn, warmup=max(5, warmup), active=max(10, rep), keep_res=keep_res)
-        print(f"Average time on NPU: {avg_times:.2f} us")
-        return _summarize_statistics(torch.tensor([avg_times], dtype=torch.float), quantiles, return_mode)
-    elif enable_bench_gpu:
-        avg_times = do_bench_gpu(fn, warmup=max(5, warmup), active=max(10, rep))
-        return _summarize_statistics(torch.tensor([avg_times], dtype=torch.float), quantiles, return_mode)
-
-
-def _summarize_statistics(times, quantiles, return_mode):
-    import torch
-    if quantiles is not None:
-        ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()
-        if len(ret) == 1:
-            ret = ret[0]
-        return ret
-    if return_mode == "all":
-        return times.tolist()
-    return getattr(torch, return_mode)(times).item()
-
-
-def do_bench_npu(fn, warmup=5, active=30, prof_dir=None, keep_res=False):
-    import torch
-    import torch_npu
-    from datetime import datetime, timezone
-
-    # warmup kernel
-    fn()
-    torch.npu.synchronize()
-
-    experimental_config = torch_npu.profiler._ExperimentalConfig(
-        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-        l2_cache=False,
-        data_simplification=False
-    )
-    skip_first = 1
-    wait = 0
-    repeat = 1
-    total = skip_first + (wait + warmup + active) * repeat
-
-    if prof_dir is not None:
-        torch_path = prof_dir
-    else:
-        process = multiprocessing.current_process()
-        pid = process.pid
-        process_name = process.name
-        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-        torch_path = os.path.join("profile_results", f"prof_{timestamp}_{process_name}-{pid}")
-    with torch_npu.profiler.profile(
-        activities=[
-            torch_npu.profiler.ProfilerActivity.CPU,
-            torch_npu.profiler.ProfilerActivity.NPU
-        ],
-        schedule=torch_npu.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat, skip_first=skip_first),
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-        with_flops=False,
-        with_modules=False,
-        experimental_config=experimental_config,
-    ) as prof:
-        for _ in range(total):
-            fn()
-            prof.step()
-            torch.npu.synchronize()
-    time = collect_single(torch_path)
-    del prof
-    torch.npu.empty_cache()
-
-    if not keep_res:
-        import shutil
-        if os.path.exists(torch_path):
-            shutil.rmtree(torch_path)
-
-    return time
-
-
-def do_bench_gpu(fn, warmup=5, active=30):
-    from datetime import datetime, timezone
-
-    # warmup kernel
-    fn()
-    torch.cuda.synchronize()
-
-    skip_first = 10
-    wait = 0
-    repeat = 1
-    total = skip_first + (wait + warmup + active) * repeat
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat, skip_first=skip_first),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-        with_flops=False,
-        with_modules=False,
-    ) as prof:
-        torch.cuda.synchronize()
-        for i in range(total):
-            fn()
-            prof.step()
-        torch.cuda.synchronize()
-
-    times = parse_prof(prof)
-    del prof
-    torch.cuda.empty_cache()
-
-    return times
-
-
-def parse_prof(prof):
-    event_list = prof.events()
-    parsed_times = []
-
-    for evt in event_list:
-        if evt.device_type == torch.profiler.DeviceType.CUDA:
-            parsed_times.append(evt.device_time_total)
-    
-    return parsed_times
-
-
-if __name__ == "__main__":
-    run_test_op(4, 32, 2048, 64, False, torch.bfloat16, 128, 256)

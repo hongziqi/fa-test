@@ -212,11 +212,11 @@ def get_autotune_config_old():
 
 def get_autotune_config():
     configs = []
-    BM_list = [64]  # [64, 128, 256]
-    BN_list = [64]  # [64, 128, 256, 512]
+    # BM_list = [64]  # [64, 128, 256]
+    # BN_list = [64]  # [64, 128, 256, 512]
 
-    # BM_list = [64, 128, 256]
-    # BN_list = [64, 128, 256, 512]
+    BM_list = [64, 128, 256]
+    BN_list = [64, 128, 256, 512]
 
     multibuffer_list = [True]  # [True, False]
     unit_flag_list = [True]  # [True, False]
@@ -225,12 +225,12 @@ def get_autotune_config():
 
     # These knobs are tuned only when limit_auto_multi_buffer_only_for_local_buffer=False
     set_workspace_multibuffer_list = [2]  # [2, 4]
-    nested_sub_block_num_list = [2]  # [2, 4, 8]
+    # nested_sub_block_num_list = [2]  # [2, 4, 8]
     # set_workspace_multibuffer_list = [2, 4]  # [2, 4]
     # nested_sub_block_num_list = [2, 4]  # [2, 4, 8]
     enable_hivm_auto_cv_balance_list = [True]  # [True, False]
-    # nested_vector_loop_num_list = [2]  # [2, 4]
-    # nested_cube_loop_num_list = [2]  # [2, 4]
+    nested_vector_loop_num_list = [2]  # [2, 4]
+    nested_cube_loop_num_list = [2]  # [2, 4]
 
     for (
         BM,
@@ -263,16 +263,16 @@ def get_autotune_config():
             # Fully expand tuning space
             for (
                 set_workspace_multibuffer,
-                nested_sub_block_num,
+                # nested_sub_block_num,
                 enable_hivm_auto_cv_balance,
-                # nested_vector_loop_num,
-                # nested_cube_loop_num,
+                nested_vector_loop_num,
+                nested_cube_loop_num,
             ) in itertools.product(
                 set_workspace_multibuffer_list,
-                nested_sub_block_num_list,
+                # nested_sub_block_num_list,
                 enable_hivm_auto_cv_balance_list,
-                # nested_vector_loop_num_list,
-                # nested_cube_loop_num_list,
+                nested_vector_loop_num_list,
+                nested_cube_loop_num_list,
             ):
                 configs.append(
                     triton.Config(
@@ -774,14 +774,14 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
 
         # 性能测试
         # kernel_avg_time = do_bench(profiling_forward_fn, keep_res=False, rep=10)
-        allocated_memory = torch.npu.memory_allocated()
-        print(">> before run: ", allocated_memory)
-        for i in range(1000):
-            attention(q, k, v, causal, sm_scale, BM, BN)
-            allocated_memory = torch.npu.memory_allocated()
-            print(f">> before after {i}: {allocated_memory}")
-        # kernel_avg_time = do_bench(profiling_forward_fn, rep=10)
-        # print(f">> Kernel average time: {kernel_avg_time}")
+        # allocated_memory = torch.npu.memory_allocated()
+        # print(">> before run: ", allocated_memory)
+        # for i in range(1000):
+        #     attention(q, k, v, causal, sm_scale, BM, BN)
+        #     allocated_memory = torch.npu.memory_allocated()
+        #     print(f">> before after {i}: {allocated_memory}")
+        kernel_avg_time = do_bench(profiling_forward_fn, rep=10)
+        print(f">> Kernel average time: {kernel_avg_time}")
 
         test_results.append({
             "From": From,
@@ -799,7 +799,7 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
             "result": "Success",
             # "Precision result": "Pass" if passed else "Fail",
             # **{f"Actual out {k}": str(v) for k, v in errors.items()},
-            # "Actual kernel time forward": kernel_avg_time,
+            "Actual kernel time forward": kernel_avg_time,
         })
     except Exception as e:
         # 捕获异常并记录测试结果
