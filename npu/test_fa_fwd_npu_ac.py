@@ -111,7 +111,7 @@ def _attn_fwd_inner(acc_ptr, l_i, m_i, q,  #
         # alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
         # -- update output accumulator --
-        if HEAD_DIM <= 256:
+        if HEAD_DIM < 256:
             acc_ptr = acc_ptr * alpha[:, None]
             acc_ptr = tl.dot(p_cast, v, acc_ptr)
         else:
@@ -226,7 +226,7 @@ def _attn_fwd(Q, K, V, M, Out, sm_scale: tl.constexpr, acc, #
 
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-        if HEAD_DIM <= 256:
+        if HEAD_DIM < 256:
             acc_ptr = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
         else:
             acc_offset = (
@@ -262,7 +262,7 @@ def _attn_fwd(Q, K, V, M, Out, sm_scale: tl.constexpr, acc, #
         # epilogue
         # m_i += tl.math.log2(l_i)
         m_i += tl.math.log(l_i)
-        if HEAD_DIM <= 256:
+        if HEAD_DIM < 256:
             accumulator = acc_ptr / l_i[:, None]
         else:
             row = tl.arange(0, BLOCK_M)[:, None]

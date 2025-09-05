@@ -115,7 +115,7 @@ def _attn_fwd_inner(acc_ptr, l_i, m_i, q,  #
         # alpha = tl.math.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
         # -- update output accumulator --
-        if HEAD_DIM <= 256:
+        if HEAD_DIM < 256:
             acc_ptr = acc_ptr * alpha[:, None]
             acc_ptr = tl.dot(p_cast, v, acc_ptr)
         else:
