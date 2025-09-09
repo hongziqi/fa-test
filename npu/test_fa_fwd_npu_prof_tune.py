@@ -192,8 +192,8 @@ def get_autotune_config():
     set_workspace_multibuffer_list = [2, 4]  # [2, 4]
     # nested_sub_block_num_list = [2, 4]  # [2, 4, 8]
     enable_hivm_auto_cv_balance_list = [True]  # [True, False]
-    nested_vector_loop_num_list = [2, 4]  # [2, 4]
-    nested_cube_loop_num_list = [2, 4]  # [2, 4]
+    tile_mix_vector_loop_num_list = [2, 4]  # [2, 4]
+    tile_mix_cube_loop_num_list = [2, 4]  # [2, 4]
 
     for (
         BM,
@@ -228,14 +228,14 @@ def get_autotune_config():
                 set_workspace_multibuffer,
                 # nested_sub_block_num,
                 enable_hivm_auto_cv_balance,
-                nested_vector_loop_num,
-                nested_cube_loop_num,
+                tile_mix_vector_loop,
+                tile_mix_cube_loop,
             ) in itertools.product(
                 set_workspace_multibuffer_list,
                 # nested_sub_block_num_list,
                 enable_hivm_auto_cv_balance_list,
-                nested_vector_loop_num_list,
-                nested_cube_loop_num_list,
+                tile_mix_vector_loop_num_list,
+                tile_mix_cube_loop_num_list,
             ):
                 configs.append(
                     triton.Config(
@@ -247,8 +247,8 @@ def get_autotune_config():
                         set_workspace_multibuffer=set_workspace_multibuffer,
                         # nested_sub_block_num=nested_sub_block_num,
                         enable_hivm_auto_cv_balance=enable_hivm_auto_cv_balance,
-                        nested_vector_loop_num=nested_vector_loop_num,
-                        nested_cube_loop_num=nested_cube_loop_num,
+                        tile_mix_vector_loop=tile_mix_vector_loop,
+                        tile_mix_cube_loop=tile_mix_cube_loop,
                     )
                 )
 
