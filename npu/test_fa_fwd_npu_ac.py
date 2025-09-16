@@ -15,7 +15,7 @@ from typing import Dict, Tuple, Optional, Any, Union, List
 torch.npu.set_device(0)
 # ========== 全局变量和常量 ==========
 DEVICE = "npu"
-TEST_DATA_DIR = "/home/coder/fa-test/test_data"
+TEST_DATA_DIR = "/home/coder/fa-test-batch/test_data"
 RESULT_DIR = "./test_results"
 os.makedirs(RESULT_DIR, exist_ok=True)
 
@@ -30,7 +30,7 @@ dtype_map = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': torch.float3
              'torch.bfloat16': torch.bfloat16, 'torch.float16': torch.float16, 'torch.float32': torch.float32}
 
 # D 泛化列表
-D_FANHUA_LIST = [64, 72, 80, 88, 96, 128, 256]
+D_FANHUA_LIST = [64, 80, 96, 128, 256]
 
 # ========== Triton Kernel 实现 0904（保持不变） ==========
 def is_hip():
@@ -164,11 +164,12 @@ def _attn_fwd(Q, K, V, M, Out, sm_scale: tl.constexpr, acc, #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
               STAGE: tl.constexpr,  #
-              NUM_BLOCKS_PER_CORE: tl.constexpr,
-              NUM_BLOCKS: tl.constexpr,
-              NUM_BLOCKS_M: tl.constexpr,
               ):
     # ???, why
+    NUM_BLOCKS_M = N_CTX // BLOCK_M
+    NUM_BLOCKS = NUM_BLOCKS_M * Z * H
+    NUM_BLOCKS_PER_CORE = (NUM_BLOCKS+ 19) // 20
+
     pid = tl.program_id(0)
     block_start = pid * NUM_BLOCKS_PER_CORE
     NUM_BLOCKS_hz = NUM_BLOCKS // NUM_BLOCKS_M
@@ -298,13 +299,7 @@ class _attention(torch.autograd.Function):
         #     waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
         #     extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
         num_cores = 20
-        NUM_BLOCKS_M = triton.cdiv(q.shape[2], BM)
-        NUM_BLOCKS = NUM_BLOCKS_M * q.shape[0] * q.shape[1]
-        NUM_BLOCKS_PER_CORE = triton.cdiv(NUM_BLOCKS, num_cores)
-        # grid = lambda args: (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
         acc = torch.zeros((q.shape[0], q.shape[1], q.shape[2], HEAD_DIM_K), dtype=torch.float32, device=q.device)
-        # grid = (triton.cdiv(q.shape[2], BM),1, 1)
-        # (1, 2, 1024)
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         _attn_fwd[(num_cores,)](
             q, k, v, M, o, sm_scale, acc, #
@@ -317,9 +312,6 @@ class _attention(torch.autograd.Function):
             BLOCK_M = BM, # 32
             BLOCK_N = BN, # 32
             STAGE=stage,
-            NUM_BLOCKS_PER_CORE=NUM_BLOCKS_PER_CORE,
-            NUM_BLOCKS=NUM_BLOCKS,
-            NUM_BLOCKS_M=NUM_BLOCKS_M,
             **extra_kern_args)
 
 
@@ -391,29 +383,6 @@ def extract_test_case_data(
     :param insert_row: 基于原来案例+需改变的字段，插入新的测试数据, 例如{"D": [64, 72, 80, 88, 96, 128, 256]}, 即每个 D 值都生成一个新的测试案例
     :param save_path: 可选的保存路径，如果提供则将结果保存为 Excel 文件
     :return: 提取的测试用例数据
-    Example:
-    paths = {
-        "64": "FlashAttentionScore_step64_case_d64_Result.xls",
-        "7": "FlashAttentionScore_step64+7_case_d64_Result.xls"
-    }
-    extract_map = {
-        "Testcase Name": "Testcase Name",
-        "Level": "Level",
-        "Network Type": "Network Type",
-        "B": "Z",
-        "N1": "H",
-        "S1": "N_CTX",
-        "D": "HEAD_DIM",
-        "Dtype": "dtype",
-        "sparse mode": "sparse_mode",
-        "Layout": "Layout",
-        # 其他需要提取的字段...
-    }
-    new_field = {
-        "BM": 32,
-        "BN": 32,
-        "causal": False,
-    }
     """
     # 临时设置显示选项
     pd.set_option('display.max_columns', None)        # 显示所有列
@@ -454,6 +423,13 @@ def extract_test_case_data(
                 extracted_data = extracted_data[extracted_data[key] == value]
             else:
                 print(f"警告: 过滤条件中的字段 '{key}' 在数据中不存在，跳过该过滤条件。")
+    # 【NPU】当前 kernel 功能只支持 S1 整除 BN 和 BM 的情况，非整除的过滤掉（会导致精度问题）
+    if 'S1' in extracted_data.columns and 'BN' in extracted_data.columns:
+        extracted_data = extracted_data[extracted_data['S1'] % extracted_data['BN'] == 0]
+    if 'S1' in extracted_data.columns and 'BM' in extracted_data.columns:
+        extracted_data = extracted_data[extracted_data['S1'] % extracted_data['BM'] == 0]
+    # 重置索引
+    extracted_data = extracted_data.reset_index(drop=True)
     # 抽样
     if sampling and len(extracted_data) > sampling_rows:
        # 保留首行，然后每隔 sampling_rows 行采样一行
@@ -511,14 +487,13 @@ def pytest_generate_tests(metafunc):
     """
     if 'test_case' in metafunc.fixturenames:
         # 生成测试用例数据
+        other_paths = {
+            "cv融合": os.path.join(TEST_DATA_DIR, "cv_cases.xlsx"),
+            "模型规格": os.path.join(TEST_DATA_DIR, "model_cases.xlsx"),
+        }
         paths = {
-            # "step64_01": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result_01.xls"),
-            # "step64_02": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result_02.xls"),
-            # "step64+7_01": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result_01.xls"),
-            # "step64+7_02": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result_02.xls"),
             "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result.xls"),
             "step64+7": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result.xls"),
-            # "test": os.path.join(TEST_DATA_DIR, "prof_case_test.xlsx"),
         }
         extract_map = {
             "From": "From",
@@ -539,38 +514,24 @@ def pytest_generate_tests(metafunc):
         filter_data = {
             "Layout": "BNSD",  # 只测试 BNSD 布局(4096)
         }
-        # # 提取测试数据
-        # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=True, sampling_rows=32,
-        #                                    insert_row={"D": D_FANHUA_LIST}, save_path=f"{RESULT_DIR}/extract_test_case_ac.xlsx")
-        # # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=True, sampling_rows=32,
-        # #                             insert_row={"D": D_FANHUA_LIST}, save_path=f"{RESULT_DIR}/extract_test_case_ac.xlsx")
+        # # 01.模型规格数据 + cv融合数据 (测试案例共 19 个)
+        # test_data_01 = extract_test_case_data(other_paths, extract_map, new_field, filter_data)
+        # print(f"\n>>>> 其他测试文件共生成 {len(test_data_01)} 个测试案例。")
+        # # 02.提取测试数据，不进行抽样，进行D泛化 (测试案例共 10240 个)
+        # test_data_02 = extract_test_case_data(paths, extract_map, new_field, filter_data, 
+        #                                       insert_row={"D": D_FANHUA_LIST}, save_path=f"{RESULT_DIR}/extract_test_case_ac.xlsx")
+        # print(f">>>> 泛化测试文件共生成 {len(test_data_02)} 个测试案例。")
+       
+        # test_data = pd.concat([test_data_01, test_data_02], ignore_index=True).reset_index(drop=True)
 
         # test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
+        # print(f">>>> 总共生成 {len(test_cases)} 个测试案例。") # 10259
         # # 确保只对 test_case 参数化一次
         # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
 
         # 非测试文件的测试案例
         test_cases = [
-            # [1, 3, 53255, 128, False, torch.bfloat16, 64, 64, "step64+7", "FlashAttentionScore_BNSD_0833", 0],
-            # [1, 24, 15296, 64, False, torch.bfloat16, 64, 64, "step64_01", "FlashAttentionScore_BNSD_0239", 0],
-            # [1, 3, 75328, 64, False, torch.bfloat16, 64, 64, "step64_02", "FlashAttentionScore_BNSD_1177", 0],
-            # [1, 3, 64000, 64000, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
-            # [1, 24, 9792, 72, False, torch.bfloat16, 64, 64, "step64", "FlashAttentionScore_BNSD_0153", 0],
-            [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
-            # [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
-            # [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
-            # [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
-            # [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
-            # [2, 8, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "LLaMa_RealCase_0007", 0],
-            # [1, 12, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0001", 0],
-            # [1, 12, 4096, 128, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0002", 0],
-            # [1, 4, 4096, 256, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0003", 0],
-            # [1, 8, 8192, 128, False, torch.bfloat16, 64, 64, "模型规格", "TongYiQianWen_RealCase_0001", 0],
-            # [1, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_173", 0],
-            # [1, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_174", 0],
-            # [2, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_175", 0],
-            # [2, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_176", 0],
-            [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
+           [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
             # [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
             # [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
             # [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
