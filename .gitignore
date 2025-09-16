@@ -8,3 +8,5 @@ fusion_result.json
 kernel_meta/
 
 *.log
+
+FA_FWD_PROF/
