@@ -677,8 +677,7 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
             attention(q, k, v, causal, sm_scale, BM, BN)
 
         # 性能测试
-        shape_str = f"{B}_{N1}_{S1}_{D}_{From}_{test_name}"
-        kernel_avg_time = do_bench_npu(profiling_forward_fn, active=10, keep_res=False, shape_str=shape_str)
+        kernel_avg_time = do_bench(profiling_forward_fn, rep=10)
         print(f">> Kernel average time: {kernel_avg_time}")
 
         test_results.append({
@@ -744,58 +743,3 @@ def collect_single(base_dir: str, key: str = None) -> float:
                 return df.loc[0, 'Avg Time(us)']
 
     return float('inf')
-
-
-def do_bench_npu(fn, warmup=5, active=30, prof_dir=None, keep_res=False, shape_str=""):
-    import torch
-    import torch_npu
-    from datetime import datetime, timezone
-
-    # warmup kernel
-    fn()
-    torch.npu.synchronize()
-
-    experimental_config = torch_npu.profiler._ExperimentalConfig(
-        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-        l2_cache=False,
-        data_simplification=False
-    )
-    skip_first = 5
-    wait = 0
-    repeat = 1
-    total = skip_first + (wait + warmup + active) * repeat
-
-    if prof_dir is not None:
-        torch_path = prof_dir
-    else:
-        process = multiprocessing.current_process()
-        pid = process.pid
-        process_name = process.name
-        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-        torch_path = "./FA_FWD_PROF/" + shape_str
-    with torch_npu.profiler.profile(
-        activities=[
-            torch_npu.profiler.ProfilerActivity.NPU
-        ],
-        schedule=torch_npu.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat, skip_first=skip_first),
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-        with_flops=False,
-        with_modules=False,
-        experimental_config=experimental_config,
-    ) as prof:
-        for _ in range(total):
-            fn()
-            prof.step()
-            torch.npu.synchronize()
-    time = collect_single(torch_path)
-
-    if not keep_res:
-        import shutil
-        if os.path.exists(torch_path):
-            shutil.rmtree(torch_path)
-
-    return time
