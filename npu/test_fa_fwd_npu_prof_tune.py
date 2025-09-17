@@ -629,7 +629,7 @@ def pytest_generate_tests(metafunc):
         # test_data = pd.concat([test_data_01, test_data_02], ignore_index=True).reset_index(drop=True)
 
         # test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
-        # print(f">>>> 总共生成 {len(test_cases)} 个测试案例。") # 67
+        # print(f">>>> 总共生成 {len(test_cases)} 个测试案例。") # 50
 
         # # （全量）确保只对 test_case 参数化一次
         # # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
@@ -651,8 +651,8 @@ def pytest_generate_tests(metafunc):
             # [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
             # [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
             # [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
-            [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
-            # [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
+            # [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
+            [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
             # [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0], # NPU out of memory. Tried to allocate 64.00 GiB
             # [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0], # NPU out of memory. Tried to allocate 64.00 GiB
         ]
@@ -677,7 +677,9 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
             attention(q, k, v, causal, sm_scale, BM, BN)
 
         # 性能测试
-        kernel_avg_time = do_bench(profiling_forward_fn, rep=10)
+        # kernel_avg_time = do_bench(profiling_forward_fn, rep=10)
+        shape_str = f"{B}_{N1}_{S1}_{D}_{From}_{test_name}"
+        kernel_avg_time = do_bench_npu(profiling_forward_fn, active=10, shape_str=shape_str, keep_res=True)
         print(f">> Kernel average time: {kernel_avg_time}")
 
         test_results.append({
@@ -743,3 +745,58 @@ def collect_single(base_dir: str, key: str = None) -> float:
                 return df.loc[0, 'Avg Time(us)']
 
     return float('inf')
+
+
+def do_bench_npu(fn, warmup=5, active=30, prof_dir=None, keep_res=False, shape_str=""):
+    import torch
+    import torch_npu
+    from datetime import datetime, timezone
+
+    # warmup kernel
+    fn()
+    torch.npu.synchronize()
+
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        l2_cache=False,
+        data_simplification=False
+    )
+    skip_first = 5
+    wait = 0
+    repeat = 1
+    total = skip_first + (wait + warmup + active) * repeat
+
+    if prof_dir is not None:
+        torch_path = prof_dir
+    else:
+        process = multiprocessing.current_process()
+        pid = process.pid
+        process_name = process.name
+        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+        torch_path = "./FA_FWD_PROF/" + shape_str
+    with torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.NPU
+        ],
+        schedule=torch_npu.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat, skip_first=skip_first),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+    ) as prof:
+        for _ in range(total):
+            fn()
+            prof.step()
+            torch.npu.synchronize()
+    time = collect_single(torch_path)
+
+    if not keep_res:
+        import shutil
+        if os.path.exists(torch_path):
+            shutil.rmtree(torch_path)
+
+    return time
