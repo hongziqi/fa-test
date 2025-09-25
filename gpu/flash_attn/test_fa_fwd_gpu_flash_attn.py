@@ -441,10 +441,10 @@ def pytest_generate_tests(metafunc):
         }
         
 
-        # # 01.模型规格数据 + cv融合数据 (测试案例共 19 个)
+        # # 01.模型规格数据 + cv融合数据 (测试案例共 18 个)
         # test_data_01 = extract_test_case_data(other_paths, extract_map, new_field, filter_data)
         # print(f"\n>>>> 其他测试文件共生成 {len(test_data_01)} 个测试案例。")
-        # # 02.提取测试数据，进行抽样，抽样比例128，进行D泛化 (测试案例共 48 个)
+        # # 02.提取测试数据，进行抽样，抽样比例128，进行D泛化 (测试案例共 32 个)
         # test_data_02 = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=True, sampling_rows=128,
         #                                       insert_row={"D": D_FANHUA_LIST})
         # print(f">>>> 泛化测试文件共生成 {len(test_data_02)} 个测试案例。")
@@ -452,7 +452,7 @@ def pytest_generate_tests(metafunc):
         # test_data = pd.concat([test_data_01, test_data_02], ignore_index=True).reset_index(drop=True)
 
         # test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
-        # print(f">>>> 总共生成 {len(test_cases)} 个测试案例。") # 67
+        # print(f">>>> 总共生成 {len(test_cases)} 个测试案例。") # 50
 
         # （全量）确保只对 test_case 参数化一次
         # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
@@ -517,7 +517,7 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
         # )
 
         def profiling_forward_fn():
-            with torch.inference_mode():
+            with torch.no_grad():
                 flash_attn_func(q_fa, k_fa, v_fa, dropout_p=0.0, softmax_scale=sm_scale, causal=causal)
 
         # ==== 2. 性能测试 ====

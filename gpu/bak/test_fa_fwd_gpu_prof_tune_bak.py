@@ -1,5 +1,85 @@
+"""
+=========== FA Triton Kernel 泛化性测试 ===========
+已知 测试 表格: 
+  FlashAttentionScore_step64_case_d64_Result.xls 
+  FlashAttentionScore_step64+7_case_d64_Result.xls
+
+>> 每一行代表一个测试用例，包含以下字段(共78个)及示例内容：
+Group: FlashAttentionScore
+Testcase Name: FlashAttentionScore_BNSD_{num} / FlashAttentionScore_BSH_{num}
+Enable: disable/onlypref
+Level: level0
+Network Type: fanhua
+B: 1                    #
+N1: 24
+N2: 3
+S1: 64
+S2: 64
+D: 64
+Dtype: bf16
+sparse mode: 0
+pre tockens: 65536
+next tockens: 65536
+Layout: BNSD / BSH
+PSE: None
+pse type: None
+Atten mask Dtype: None
+Atten mask Shape: None
+Padding Mask: None
+keep prob: 1
+Expect out pricision: 
+Expect out err max: 
+Expect out err sum: 
+Expect out eb: 
+Expect dp pricision: 
+Actual out pricision: 0
+Actual out err max: 0
+Actual out err sum: 0
+Actual out eb: 0
+Actual dp pricision: 0
+Actual dp err max: 0
+Actual dp err sum: 0
+Actual dp eb: 0
+Actual dk pricision: 0
+Actual dk err max: 0
+Actual dk err sum: 0
+Actual dk eb: 0
+Actual dv pricision: 0
+Actual dv err max: 0
+Actual dv err sum: 0
+Actual dv eb: 0
+Actual Memory: 0
+Actual kernel time forward: 0.0316
+Actual kernel time backward: 0.0979
+Actual e2e time forward: 0
+Actual e2e time backward: 0
+Precision result: Fail
+Rmse result: Pass
+Rme result: Pass
+EB result: 
+Performance result: Fail
+Memory result: Fail
+running status: PASS
+Actual kernel time forward transpose: 0.0694
+Actual kernel time backward transpose: 0.5471
+Actual kernel time forward pad: 0
+Actual kernel time backward pad: 0.0000
+Actual kernel time forward slice: 0
+Actual kernel time backward slice: 0.0000
+Actual kernel time forward gpu:
+Actual kernel time backward gpu:
+BNSD+transpose: 0.1010
+>>
+任务描述：基于表格数据驱动 test_op_fwd, 完成泛化性测试（精度+性能）。
+精度测试：直接 NPU 侧对比 ref_out 和 tri_out 的结果。
+性能测试：与 GPU 侧对比，计算 kernel_time。
+最终目的：泛化性验证 Triton 的 FA前向算子 的精度和性能。
+=========== FA Triton Kernel 泛化性测试 ===========
+"""
+
 import pytest
 import torch
+# import torch_npu
 import triton
 import triton.language as tl
 import os
@@ -14,6 +94,7 @@ from typing import Dict, Tuple, Optional, Any, Union, List
 # ========== 全局变量和常量 ==========
 DEVICE = "cuda"
 TEST_DATA_DIR = "./test_data"
+RESULT_DIR = "./test_results"
 RESULT_DIR = "./test_results_batch"
 os.makedirs(RESULT_DIR, exist_ok=True)
 
@@ -28,7 +109,7 @@ dtype_map = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': torch.float3
              'torch.bfloat16': torch.bfloat16, 'torch.float16': torch.float16, 'torch.float32': torch.float32}
 
 # D 泛化列表
-D_FANHUA_LIST = [64, 128]
+D_FANHUA_LIST = [64, 72, 80, 88, 96, 128, 256]
 
 # ========== Triton Kernel 社区实现（保持不变）:https://github.com/triton-lang/triton/blob/v3.2.0/python/tutorials/06-fused-attention.py ==========
 def is_hip():
@@ -88,6 +169,36 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
     return acc, l_i, m_i
 
+
+# def get_autotune_config():
+#     return [
+#         triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_stages=1, num_warps=1),
+
+#         triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+#         triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_stages=1, num_warps=1),
+
+#         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+
+#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 16}, num_stages=1, num_warps=1),
+#         # triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=1, num_warps=1),
+#         # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=1, num_warps=1),
+#     ]
+
+# values = {"has_exception": False}
+
+
+# def _post_hook(*args, exception):
+#     if exception is not None:
+#         print(f">> Triton kernel exception: {exception}")
+#         values["has_exception"] = True
+
+
+# @triton.autotune(
+#     configs=get_autotune_config(),
+#     key=['Z', 'H', 'N_CTX', 'HEAD_DIM'],  # 加入 shape 相关的关键参数
+#     post_hook=_post_hook,
+# )
 
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
 # the code below and commenting out the equivalent parameters is convenient for
@@ -302,6 +413,27 @@ def extract_test_case_data(
     :param insert_row: 基于原来案例+需改变的字段，插入新的测试数据, 例如{"D": [64, 72, 80, 88, 96, 128, 256]}, 即每个 D 值都生成一个新的测试案例
     :param save_path: 可选的保存路径，如果提供则将结果保存为 Excel 文件
     :return: 提取的测试用例数据
+    Example:
+    paths = {
+        "64": "FlashAttentionScore_step64_case_d64_Result.xls",
+        "7": "FlashAttentionScore_step64+7_case_d64_Result.xls"
+    }
+    extract_map = {
+            "From": "From",
+            "Testcase Name": "Testcase Name",
+            "B": "B",
+            "N1": "N1",
+            "S1": "S1",
+            "D": "D",
+            "Dtype": "dtype",
+            "sparse mode": "sparse mode",
+            "Layout": "Layout",
+        }
+    new_field = {
+        "BM": 64,
+        "BN": 64,
+        "causal": False,
+    }
     """
     # 临时设置显示选项
     pd.set_option('display.max_columns', None)        # 显示所有列
@@ -342,19 +474,6 @@ def extract_test_case_data(
                 extracted_data = extracted_data[extracted_data[key] == value]
             else:
                 print(f"警告: 过滤条件中的字段 '{key}' 在数据中不存在，跳过该过滤条件。")
-
-    # 【NPU】当前 kernel 功能只支持 S1 整除 BN 和 BM 的情况，非整除的过滤掉（会导致精度问题）
-    if 'S1' in extracted_data.columns and 'BN' in extracted_data.columns:
-        extracted_data = extracted_data[extracted_data['S1'] % extracted_data['BN'] == 0]
-    if 'S1' in extracted_data.columns and 'BM' in extracted_data.columns:
-        extracted_data = extracted_data[extracted_data['S1'] % extracted_data['BM'] == 0]
-    # 过滤掉 D >= 256 的案例
-    if 'D' in extracted_data.columns:
-        extracted_data = extracted_data[extracted_data['D'] < 256]
-
-    # 重置索引
-    extracted_data = extracted_data.reset_index(drop=True)
-
     # 抽样
     if sampling and len(extracted_data) > sampling_rows:
        # 保留首行，然后每隔 sampling_rows 行采样一行
@@ -412,13 +531,15 @@ def pytest_generate_tests(metafunc):
     """
     if 'test_case' in metafunc.fixturenames:
         # 生成测试用例数据
-        other_paths = {
-            "cv融合": os.path.join(TEST_DATA_DIR, "cv_cases.xlsx"),
-            "模型规格": os.path.join(TEST_DATA_DIR, "model_cases.xlsx"),
-        }
         paths = {
-            "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result.xls"),
-            "step64+7": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result.xls"),
+            # "prof01": os.path.join(TEST_DATA_DIR, "prof_case_274.xlsx"),
+            # "prof01": os.path.join(TEST_DATA_DIR, "prof_case_all.xlsx"),
+            "prof01": os.path.join(TEST_DATA_DIR, "prof_case_test_gpu.xlsx"),
+            # "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_test.xls"),
+            # "step64": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64_case_d64_Result.xls"),
+            # "step64+7": os.path.join(TEST_DATA_DIR, "FlashAttentionScore_step64+7_d64_Result.xls"),
+            # "extract": os.path.join(RESULT_DIR, "extract_test_case_prof.xlsx"),
+            # "retest": os.path.join(TEST_DATA_DIR, "space_retest_gpu.xlsx"),
         }
         extract_map = {
             "From": "From",
@@ -441,45 +562,53 @@ def pytest_generate_tests(metafunc):
         }
         
 
-        # # 01.模型规格数据 + cv融合数据 (测试案例共 18 个)
-        # test_data_01 = extract_test_case_data(other_paths, extract_map, new_field, filter_data)
-        # print(f"\n>>>> 其他测试文件共生成 {len(test_data_01)} 个测试案例。")
-        # # 02.提取测试数据，进行抽样，抽样比例128，进行D泛化 (测试案例共 32 个)
-        # test_data_02 = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=True, sampling_rows=128,
-        #                                       insert_row={"D": D_FANHUA_LIST})
-        # print(f">>>> 泛化测试文件共生成 {len(test_data_02)} 个测试案例。")
-       
-        # test_data = pd.concat([test_data_01, test_data_02], ignore_index=True).reset_index(drop=True)
+        # 提取测试数据
+        # test_data = extract_test_case_data(paths, extract_map, new_field, filter_data, sampling=False, sampling_rows=128,
+        #                                    insert_row={"D": D_FANHUA_LIST})
+        test_data = extract_test_case_data(paths, extract_map, new_field, filter_data)
 
-        # test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
-        # print(f">>>> 总共生成 {len(test_cases)} 个测试案例。") # 50
+        test_cases = [row[valid_fields].to_dict() for _, row in test_data.iterrows()]
 
-        # # （全量）确保只对 test_case 参数化一次
-        # # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
+        # （全量）确保只对 test_case 参数化一次
+        # metafunc.parametrize("test_case", test_cases, ids=[f"{case['From']}_{case['Testcase Name']}" for case in test_cases])
 
-        # # （分批）对 test_case 参数化
-        # # 选择当前批次的测试案例
-        # start_index = metafunc.config.getoption("start_index")
-        # batch_size = metafunc.config.getoption("batch_size")
-        # end_index = min(start_index + batch_size, len(test_cases))
-        # batch_cases = test_cases[start_index:end_index]
-        # print(f">>> Running test batch: {start_index} to {end_index-1} ({len(batch_cases)} cases)")
-        # metafunc.parametrize("test_case", batch_cases, 
-        #                     ids=[f"{case['From']}_{case['Testcase Name']}" for case in batch_cases])
+        # （分批）对 test_case 参数化
+        # 选择当前批次的测试案例
+        start_index = metafunc.config.getoption("start_index")
+        batch_size = metafunc.config.getoption("batch_size")
+        end_index = min(start_index + batch_size, len(test_cases))
+        batch_cases = test_cases[start_index:end_index]
+        print(f">>> Running test batch: {start_index} to {end_index-1} ({len(batch_cases)} cases)")
+        metafunc.parametrize("test_case", batch_cases, 
+                            ids=[f"{case['From']}_{case['Testcase Name']}" for case in batch_cases])
 
         # 非测试文件的测试案例
-        test_cases = [
-            # [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
-            # [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
-            # [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
-            # [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
-            [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
-            # [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
-            # [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0],
-            # [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0],
+        # test_cases = [
+        #     # [1, 128, 8192, 192, False, torch.bfloat16, 64, 64, "模型规格", "DeepSeekV2_0001", 0],
+        #     [1, 14, 111800, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0001", 0],
+        #     [1, 14, 251300, 128, False, torch.bfloat16, 64, 64, "模型规格", "MFU_0002", 0],
+        #     [24, 5, 9216, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0001", 0],
+        #     [24, 10, 2304, 64, False, torch.float16, 64, 64, "模型规格", "XingHuoTuWenSD_RealCase_0003", 0],
+        #     [2, 8, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "LLaMa_RealCase_0007", 0],
+        #     [1, 12, 4096, 128, False, torch.bfloat16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0001", 0],
+        #     [1, 12, 4096, 128, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0002", 0],
+        #     [1, 4, 4096, 256, False, torch.float16, 64, 64, "模型规格", "PanGuZhiZi_RealCase_0003", 0],
+        #     [1, 8, 8192, 128, False, torch.bfloat16, 64, 64, "模型规格", "TongYiQianWen_RealCase_0001", 0],
+        #     [1, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_173", 0],
+        #     [1, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_174", 0],
+        #     [2, 10, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_175", 0],
+        #     [2, 5, 32768, 128, False, torch.bfloat16, 64, 64, "模型规格", "X1_long_seq_176", 0],
+        #     [4, 32, 128, 128, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_1", 0],
+        #     [4, 32, 64, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_2", 0],
+        #     [1, 2, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_3", 0],
+        #     [4, 32, 1024, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_4", 0],
+        #     [4, 32, 2048, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_5", 0],
+        #     [4, 32, 4096, 64, False, torch.float16, 64, 64, "cv融合", "FlashAttentionScore_BNSD_6", 0],
+        #     [4, 32, 8192, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_7", 0],
+        #     [4, 32, 16384, 64, False, torch.float16, 32, 32, "cv融合", "FlashAttentionScore_BNSD_8", 0],
 
-        ]
-        metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
+        # ]
+        # metafunc.parametrize("test_case", test_cases, ids=[f"{case[8]}_{case[10]}" for case in test_cases])
 
 
 def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
@@ -518,8 +647,7 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
                 attention(q, k, v, causal, sm_scale)
 
         # ==== triton kernel 性能测试 ====
-        avg_times = do_bench_gpu(profiling_forward_fn, active=20)
-        kernel_avg_time = _summarize_statistics(torch.tensor([avg_times], dtype=torch.float))
+        kernel_avg_time = do_bench(profiling_forward_fn, keep_res=False, rep=20)
         print(f">> Kernel average time: {kernel_avg_time}")
 
         test_results.append({
@@ -532,8 +660,12 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
             "Dtype": dtype,
             "sparse mode": str(sparse_mode),
             "Layout": "BNSD",
+            "BM": BM,
+            "BN": BN,
             "causal": str(causal),
             "result": "Success",
+            # "Precision result": "Pass" if passed else "Fail",
+            # **{f"Actual out {k}": v for k, v in errors.items()},
             "Actual kernel time forward": kernel_avg_time,
         })
 
@@ -549,6 +681,8 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
             "Dtype": dtype,
             "sparse mode": str(sparse_mode),
             "Layout": "BNSD",
+            "BM": BM,
+            "BN": BN,
             "causal": str(causal),
             "result": "Error",
             "Error Message": str(e),
@@ -558,9 +692,66 @@ def test_op_fwd(test_case:  Union[Dict[str, Any], List[Any]]):
     finally:
         # 显式删除张量，释放计算图
         del q, k, v
+        # 强制Python垃圾回收
+        import gc
+        gc.collect()
+        # 额外延迟确保NPU完全重置
+        time.sleep(1)
 
 
-def _summarize_statistics(times, quantiles=None, return_mode="mean"):
+def collect_single(base_dir: str, key: str = None) -> float:
+    if not os.path.exists(base_dir):
+        return float('inf')
+
+    import pandas as pd
+    for root, _, files in os.walk(base_dir):
+        for file in files:
+            if file != 'op_statistic.csv':
+                continue
+            target_file = os.path.join(root, file)
+            df = pd.read_csv(target_file)
+            if key is not None:
+                key_rows = df[df['OP Type'].str.startswith(key, na=False)]
+                if not key_rows.empty:
+                    return key_rows['Avg Time(us)'].values[0]
+                return float('inf')
+            else:
+                # default: read the first row except header
+                return df.loc[0, 'Avg Time(us)']
+
+    return float('inf')
+
+def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean", keep_res=False):
+    """
+    Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
+    the 20-th and 80-th performance percentile.
+
+    :param fn: Function to benchmark
+    :type fn: Callable
+    :param warmup: Warmup time (in ms)
+    :type warmup: int
+    :param rep: Repetition time (in ms)
+    :type rep: int
+    :param grad_to_none: Reset the gradient of the provided tensor to None
+    :type grad_to_none: torch.tensor, optional
+    :param quantiles: Performance percentile to return in addition to the median.
+    :type quantiles: list[float], optional
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".    :type return_mode: str
+    """
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+    import torch
+
+    enable_bench_npu = os.getenv("TRITON_BENCH_METHOD", 'default').lower() in ('npu')
+    enable_bench_gpu = os.getenv("TRITON_BENCH_METHOD", 'default').lower() in ('gpu')
+    if enable_bench_npu:
+        avg_times = do_bench_npu(fn, warmup=max(5, warmup), active=max(10, rep), keep_res=keep_res)
+        return _summarize_statistics(torch.tensor([avg_times], dtype=torch.float), quantiles, return_mode)
+    elif enable_bench_gpu:
+        avg_times = do_bench_gpu(fn, warmup=max(5, warmup), active=max(10, rep))
+        return _summarize_statistics(torch.tensor([avg_times], dtype=torch.float), quantiles, return_mode)
+
+
+def _summarize_statistics(times, quantiles, return_mode):
     import torch
     if quantiles is not None:
         ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()
@@ -570,6 +761,64 @@ def _summarize_statistics(times, quantiles=None, return_mode="mean"):
     if return_mode == "all":
         return times.tolist()
     return getattr(torch, return_mode)(times).item()
+
+
+def do_bench_npu(fn, warmup=5, active=30, prof_dir=None, keep_res=False):
+    import torch
+    import torch_npu
+    from datetime import datetime, timezone
+
+    # warmup kernel
+    fn()
+    torch.npu.synchronize()
+
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        l2_cache=False,
+        data_simplification=False
+    )
+    skip_first = 1
+    wait = 0
+    repeat = 1
+    total = skip_first + (wait + warmup + active) * repeat
+
+    if prof_dir is not None:
+        torch_path = prof_dir
+    else:
+        process = multiprocessing.current_process()
+        pid = process.pid
+        process_name = process.name
+        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+        torch_path = os.path.join("profile_results", f"prof_{timestamp}_{process_name}-{pid}")
+    with torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU
+        ],
+        schedule=torch_npu.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat, skip_first=skip_first),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+    ) as prof:
+        for _ in range(total):
+            fn()
+            prof.step()
+            torch.npu.synchronize()
+    time = collect_single(torch_path)
+    del prof
+    torch.npu.empty_cache()
+
+    if not keep_res:
+        import shutil
+        if os.path.exists(torch_path):
+            shutil.rmtree(torch_path)
+
+    return time
 
 
 def do_bench_gpu(fn, warmup=5, active=30):
